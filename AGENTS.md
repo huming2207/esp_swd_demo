@@ -87,14 +87,48 @@ swd: JTAG2SWD fail
 JTAG-to-SWD sequence. The exact raw three-bit ACK was not captured.
 
 A real configurable microsecond guard was subsequently implemented in commit
-`4bde669`, and the demo now selects a 1 us guard. The guarded dedicated build
-passes and its object code was inspected. There has not yet been a reported
-hardware retest after this delay change. Do not claim the delay fixed the
-physical failure until the board is rerun.
+`4bde669`, and the demo initially selected a 1 us guard. The guarded dedicated
+build passed and its object code was inspected.
 
-The regular-GPIO hardware result was not explicitly recorded in this
-conversation. The user moved on to dedicated GPIO testing, but do not infer
-that regular GPIO passed unless they confirm it or logs show it.
+A second, confirmed software defect was found on 2026-07-13. The SWD clock
+delay primitive was an empty C loop:
+
+```c
+while (--delay);
+```
+
+ESP-IDF 6.0.2's GCC 15.2.0 build at `-Os` removed that loop completely. In the
+dedicated object, `SWJ_Sequence()` emitted the SWDIO write, SWCLK clear, and
+SWCLK set instructions back-to-back. Therefore the configured 10 kHz or 500
+kHz value did not pace dedicated GPIO at all. The regular GPIO backend retained
+substantially more MMIO latency, explaining the backend-dependent behavior
+without requiring a protocol difference.
+
+The working-tree fix uses `esp_cpu_get_cycle_count()` and stores actual CPU
+cycles in `DAP_Data.clock_delay`. The dedicated build now contains
+`rsr.ccount` wait loops around both sides of every SWCLK edge. A dedicated 10
+kHz build stored 11,998 cycles per half-period; a separate regular-GPIO 500 kHz
+build stored 238 cycles. Both builds passed.
+
+The user subsequently confirmed that the CPU-cycle pacing fix makes the
+dedicated backend work on Rev 6. The regular translated-GPIO backend also
+works. No complete successful log or measured translated-board throughput is
+recorded here. The user remembers 600-800 KB/s before adding the translators.
+
+The user then tested a zero translator turnaround guard. SWD initialization
+worked, but operation stopped while reading RAM, so zero is not usable on the
+current hardware. A 250 ns guard works and compiles to a minimum 60-cycle wait
+at 240 MHz. Performance remains below the remembered pre-translator rate.
+
+The demo now selects `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1` as an explicit YOLO
+mode. It selects the existing `SWD_TransferFast()` path, whose
+`PIN_DELAY_FAST()` emits no delay instructions. The JTAG-to-SWD and generic SWD
+sequence helpers retain their minimum one-cycle delay because the original
+fully unpaced dedicated build failed during JTAG-to-SWD entry. The separate
+translator ownership guards remain active. `sdkconfig.defaults` retains the
+confirmed 250 ns value, but the user-modified generated `sdkconfig` currently
+selects 50 ns; that 50 ns value is not hardware-confirmed here. YOLO mode has
+built but has not yet been tested on hardware.
 
 ## Confirmed Rev 6 GPIO map
 
@@ -128,8 +162,9 @@ CONFIG_ESP_SWD_DATA_DIR2_PIN=16
 CONFIG_ESP_SWD_CLK_NOE_PIN=4
 CONFIG_ESP_SWD_NRST_PIN=7
 CONFIG_ESP_SWD_BOOT_PIN=5
-CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=500000
-CONFIG_ESP_SWD_TURNAROUND_DELAY_US=1
+CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1
+CONFIG_ESP_SWD_TURNAROUND_DELAY_US=0
+CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=250
 CONFIG_ESP_SWD_USE_DEDICATED_GPIO=y
 ```
 
@@ -280,11 +315,14 @@ high-impedance.
 ## Implemented turnaround delay
 
 `CONFIG_ESP_SWD_TURNAROUND_DELAY_US` used to be a documented placeholder and
-did nothing. Commit `4bde669` made it functional.
+did nothing. Commit `4bde669` made it functional. The working tree retains it
+as the whole-microsecond part and adds `CONFIG_ESP_SWD_TURNAROUND_DELAY_NS` as
+a `0..999 ns` remainder.
 
-The implementation is in `components/swd_esp/cmsis_dap/SW_DP.c` and uses
-`esp_rom_delay_us()`. This is a busy wait and the called function is in ROM,
-which is suitable for the `IRAM_ATTR` transfer helpers.
+The implementation is in `components/swd_esp/cmsis_dap/SW_DP.c`. It converts
+the combined duration to CPU cycles, rounding up, and waits using the per-core
+cycle counter. This keeps sub-microsecond values available to the `IRAM_ATTR`
+transfer helpers without calling a microsecond-only delay API.
 
 Every SWDIO ownership change now performs:
 
@@ -292,25 +330,27 @@ Every SWDIO ownership change now performs:
 1. Force SWCLK low.
 2. Raise U5 /OE (isolate U5).
 3. For target ownership, immediately disable the GPIO8 ESP output.
-4. Busy-wait CONFIG_ESP_SWD_TURNAROUND_DELAY_US.
+4. Busy-wait the configured microsecond plus nanosecond guard.
 5. Change DIR1/DIR2 and configure/preload the ESP output as required.
 6. Lower U5 /OE.
-7. Busy-wait CONFIG_ESP_SWD_TURNAROUND_DELAY_US.
+7. Busy-wait the same guard.
 8. Resume the existing SWD clock sequence.
 ```
 
-No extra SWCLK pulse is created. SWCLK stays low during both guards. A value of
-zero is handled at compile time and emits no delay calls.
+No extra SWCLK pulse is created. SWCLK stays low during both guards. Setting
+both values to zero is handled at compile time and emits no delay loops. The
+user's zero-delay test stopped during RAM reading.
 
-At 1 us there are two waits per ownership change and normally two ownership
-changes per SWD transaction, so the added cost is approximately 4 us per DP/AP
-transaction. The demo benchmark should be used to measure the real throughput
-impact rather than estimating it from clock frequency alone.
+There are two waits per ownership change and normally two ownership changes
+per SWD transaction. At the demo's 250 ns setting, the nominal added guard time
+is therefore 1 us per DP/AP transaction. The benchmark should be used to
+measure the real throughput impact rather than estimating it from clock
+frequency alone.
 
 The dedicated build disassembly was checked after this implementation:
 
-- both target-drive and host-drive helpers contain two calls to
-  `esp_rom_delay_us()`;
+- both target-drive and host-drive helpers contain two `rsr.ccount` loops;
+- the 250 ns guard compiles to a minimum 60-cycle wait at 240 MHz;
 - dedicated GPIO `ee.wr_mask_gpio_out` instructions are present;
 - dedicated GPIO `ee.get_gpio_in` instructions are present.
 
@@ -426,7 +466,9 @@ The implementation was compiled with ESP-IDF v6.0.2 from:
 
 The regular translated-GPIO demo built successfully before dedicated GPIO was
 enabled. The final dedicated-GPIO plus 1 us delay configuration also built
-successfully after the delay implementation.
+successfully after the delay implementation. The later CPU-cycle clock-pacing
+fix builds with both dedicated and regular translated GPIO under ESP-IDF
+v6.0.2.
 
 Typical setup on the original machine:
 
@@ -439,7 +481,7 @@ Use the ESP-IDF path installed on the new machine. Prefer a fresh build
 directory when comparing configurations, and verify the generated config:
 
 ```sh
-rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|TURNAROUND_DELAY_US)|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
+rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|DEFAULT_CLOCK_HZ|TURNAROUND_DELAY_(US|NS))|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
 ```
 
 Useful object-code check for the dedicated backend:
@@ -447,18 +489,21 @@ Useful object-code check for the dedicated backend:
 ```sh
 xtensa-esp32s3-elf-objdump -dr \
   build/esp-idf/swd_esp/CMakeFiles/__idf_swd_esp.dir/cmsis_dap/SW_DP.c.obj \
-  | rg 'esp_rom_delay_us|ee\.wr_mask_gpio_out|ee\.get_gpio_in'
+  | rg 'ee\.wr_mask_gpio_out|ee\.get_gpio_in|rsr\.ccount'
 ```
 
 The exact build paths can differ by ESP-IDF/CMake version.
 
 ## Next hardware-debugging steps
 
-First rerun the current committed configuration on Rev 6 and record the full
-serial log. The key unanswered question is whether the new 1 us guards change
-the `JTAG2SWD` failure.
+Run the unpaced YOLO build on Rev 6 and record the full serial log. For an
+isolated comparison against the confirmed result, use the 250 ns default. The
+generated `sdkconfig` currently selects 50 ns instead, so a run of the current
+artifact changes both SWCLK pacing and turnaround timing. The remaining
+questions are whether the fast transfer path stays stable through the RAM
+stress test and what throughput it actually achieves.
 
-If it connects:
+If it remains stable:
 
 1. Record the DP IDCODE.
 2. Run the default 100-iteration stress test.
@@ -543,7 +588,7 @@ These were identified but were not treated as blockers for the minimal demo:
 7. The component README may contain historical wording saying the top-level
    Soul Injector project lacks Rev 6 defaults. The top-level project was updated
    afterward; verify and refresh that paragraph if maintaining the docs.
-8. No hardware result after the microsecond delay commit is recorded yet.
+8. Unpaced YOLO transfer mode has not yet been tested on hardware.
 
 ## Working rules for the next Codex instance
 
@@ -555,8 +600,9 @@ These were identified but were not treated as blockers for the minimal demo:
 - Keep all dedicated-GPIO SWD calls on one explicitly pinned task/core.
 - Keep U5 isolated while changing DIR1 or output ownership.
 - Keep SWCLK low during translator settling guards.
-- Do not add hidden delays to every SWD clock bit; the current delay is only for
-  ownership transitions.
+- Keep paced SWD clocks derived from `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ`. Treat
+  `-1` as the explicit unpaced transfer sentinel, and keep the separate
+  translator-settling delay limited to ownership transitions.
 - Use `rg` for source searches and inspect the generated `sdkconfig` before
   diagnosing the selected backend.
 - Use official Espressif source/docs for dedicated GPIO behavior and the TI
