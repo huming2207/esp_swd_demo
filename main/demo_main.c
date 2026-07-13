@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <esp_cpu.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -18,6 +19,14 @@ typedef struct {
     uint64_t max_kb_s_x100;
     uint32_t successes;
 } transfer_stats_t;
+
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+typedef struct {
+    swd_perf_counters_t counters;
+    uint64_t operation_cycles;
+    uint32_t operation_count;
+} swd_profile_stats_t;
+#endif
 
 static uint64_t transfer_rate_kb_s_x100(size_t bytes, uint64_t elapsed_us)
 {
@@ -95,6 +104,184 @@ static void log_rate(const char *tag, const char *name, const transfer_stats_t *
              stats->successes);
 }
 
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+static void record_swd_profile(swd_profile_stats_t *profile,
+                               const swd_perf_counters_t *sample,
+                               uint32_t operation_cycles)
+{
+    swd_perf_counters_t *total = &profile->counters;
+
+    profile->operation_cycles += operation_cycles;
+    profile->operation_count++;
+    total->transfer_cycles += sample->transfer_cycles;
+    total->read_transfer_cycles += sample->read_transfer_cycles;
+    total->write_transfer_cycles += sample->write_transfer_cycles;
+    total->target_drive_cycles += sample->target_drive_cycles;
+    total->host_drive_cycles += sample->host_drive_cycles;
+    total->ack_ok_cycles += sample->ack_ok_cycles;
+    total->ack_wait_cycles += sample->ack_wait_cycles;
+    total->ack_fault_cycles += sample->ack_fault_cycles;
+    total->ack_error_cycles += sample->ack_error_cycles;
+    total->ack_invalid_cycles += sample->ack_invalid_cycles;
+    total->transfer_count += sample->transfer_count;
+    total->read_transfer_count += sample->read_transfer_count;
+    total->write_transfer_count += sample->write_transfer_count;
+    total->target_drive_count += sample->target_drive_count;
+    total->host_drive_count += sample->host_drive_count;
+    total->ack_ok_count += sample->ack_ok_count;
+    total->ack_wait_count += sample->ack_wait_count;
+    total->ack_fault_count += sample->ack_fault_count;
+    total->ack_error_count += sample->ack_error_count;
+    total->ack_invalid_count += sample->ack_invalid_count;
+    total->retry_call_count += sample->retry_call_count;
+    total->retry_wait_count += sample->retry_wait_count;
+    if (sample->retry_max_waits > total->retry_max_waits) {
+        total->retry_max_waits = sample->retry_max_waits;
+    }
+
+    for (size_t i = 0; i < SWD_PERF_REQUEST_BUCKET_COUNT; ++i) {
+        total->request_count[i] += sample->request_count[i];
+        total->request_ok_count[i] += sample->request_ok_count[i];
+        total->request_wait_count[i] += sample->request_wait_count[i];
+    }
+    for (size_t i = 0; i < SWD_PERF_WAIT_STREAK_BUCKET_COUNT; ++i) {
+        total->retry_wait_streaks[i] += sample->retry_wait_streaks[i];
+    }
+
+    if (sample->transfer_count != 0U) {
+        if ((total->min_transfer_cycles == 0U) ||
+            (sample->min_transfer_cycles < total->min_transfer_cycles)) {
+            total->min_transfer_cycles = sample->min_transfer_cycles;
+        }
+        if (sample->max_transfer_cycles > total->max_transfer_cycles) {
+            total->max_transfer_cycles = sample->max_transfer_cycles;
+        }
+    }
+}
+
+static uint64_t average_x100(uint64_t total, uint32_t count)
+{
+    return count == 0U ? 0U : (total * 100U) / count;
+}
+
+static uint64_t percent_x100(uint64_t part, uint64_t whole)
+{
+    return whole == 0U ? 0U : (part * 10000U) / whole;
+}
+
+static void log_swd_profile(const char *tag, const char *name,
+                            const swd_profile_stats_t *profile)
+{
+    const swd_perf_counters_t *stats = &profile->counters;
+    const uint64_t outside_cycles =
+        profile->operation_cycles > stats->transfer_cycles
+            ? profile->operation_cycles - stats->transfer_cycles
+            : 0U;
+    const uint64_t ownership_cycles =
+        stats->target_drive_cycles + stats->host_drive_cycles;
+    const uint64_t average_call_cycles =
+        average_x100(profile->operation_cycles, profile->operation_count);
+    const uint64_t average_outside_cycles =
+        average_x100(outside_cycles, profile->operation_count);
+    const uint64_t average_transfer_cycles =
+        average_x100(stats->transfer_cycles, stats->transfer_count);
+    const uint64_t average_target_cycles =
+        average_x100(stats->target_drive_cycles, stats->target_drive_count);
+    const uint64_t average_host_cycles =
+        average_x100(stats->host_drive_cycles, stats->host_drive_count);
+    const uint64_t average_ok_cycles =
+        average_x100(stats->ack_ok_cycles, stats->ack_ok_count);
+    const uint64_t average_wait_cycles =
+        average_x100(stats->ack_wait_cycles, stats->ack_wait_count);
+    const uint64_t average_waits_per_retry =
+        average_x100(stats->retry_wait_count, stats->retry_call_count);
+    const uint64_t swd_percent =
+        percent_x100(stats->transfer_cycles, profile->operation_cycles);
+    const uint64_t ownership_percent =
+        percent_x100(ownership_cycles, stats->transfer_cycles);
+    const uint64_t average_transfer_ns = stats->transfer_count == 0U
+        ? 0U
+        : stats->transfer_cycles * 1000U /
+              ((uint64_t)CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ *
+               stats->transfer_count);
+
+    ESP_LOGI(tag,
+             "%s profile: calls=%" PRIu32
+             ", avg call=%" PRIu64 ".%02" PRIu64
+             " cycles, SWD=%" PRIu64 ".%02" PRIu64
+             "%%, avg outside=%" PRIu64 ".%02" PRIu64 " cycles",
+             name, profile->operation_count,
+             average_call_cycles / 100U, average_call_cycles % 100U,
+             swd_percent / 100U, swd_percent % 100U,
+             average_outside_cycles / 100U, average_outside_cycles % 100U);
+    ESP_LOGI(tag,
+             "%s SWD: attempts=%" PRIu32 " (read/write=%" PRIu32
+             "/%" PRIu32 "), avg=%" PRIu64 ".%02" PRIu64
+             " cycles (%" PRIu64 " ns), min/max=%" PRIu32 "/%" PRIu32,
+             name, stats->transfer_count, stats->read_transfer_count,
+             stats->write_transfer_count,
+             average_transfer_cycles / 100U, average_transfer_cycles % 100U,
+             average_transfer_ns,
+             stats->min_transfer_cycles, stats->max_transfer_cycles);
+    ESP_LOGI(tag,
+             "%s U5: target/host=%" PRIu64 ".%02" PRIu64
+             "/%" PRIu64 ".%02" PRIu64
+             " cycles/change, ownership=%" PRIu64 ".%02" PRIu64
+             "%% of SWD; ACK OK/WAIT/FAULT/error/invalid=%" PRIu32
+             "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32,
+             name,
+             average_target_cycles / 100U, average_target_cycles % 100U,
+             average_host_cycles / 100U, average_host_cycles % 100U,
+             ownership_percent / 100U, ownership_percent % 100U,
+             stats->ack_ok_count, stats->ack_wait_count,
+             stats->ack_fault_count, stats->ack_error_count,
+             stats->ack_invalid_count);
+    ESP_LOGI(tag,
+             "%s ACK cost: OK=%" PRIu64 ".%02" PRIu64
+             ", WAIT=%" PRIu64 ".%02" PRIu64
+             " cycles; logical transfers=%" PRIu32
+             ", waits/logical=%" PRIu64 ".%02" PRIu64
+             ", max streak=%" PRIu32,
+             name,
+             average_ok_cycles / 100U, average_ok_cycles % 100U,
+             average_wait_cycles / 100U, average_wait_cycles % 100U,
+             stats->retry_call_count,
+             average_waits_per_retry / 100U, average_waits_per_retry % 100U,
+             stats->retry_max_waits);
+    ESP_LOGI(tag,
+             "%s WAIT streaks 0/1/2/3/4-7/8+=%" PRIu32 "/%" PRIu32
+             "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32,
+             name,
+             stats->retry_wait_streaks[0], stats->retry_wait_streaks[1],
+             stats->retry_wait_streaks[2], stats->retry_wait_streaks[3],
+             stats->retry_wait_streaks[4], stats->retry_wait_streaks[5]);
+
+    for (uint32_t request = 0; request < SWD_PERF_REQUEST_BUCKET_COUNT;
+         ++request) {
+        const uint32_t attempts = stats->request_count[request];
+        if (attempts == 0U) {
+            continue;
+        }
+
+        const uint64_t request_wait_percent = percent_x100(
+            stats->request_wait_count[request], attempts);
+
+        ESP_LOGI(tag,
+                 "%s request %s %s A=0x%" PRIx32
+                 ": attempts=%" PRIu32 ", OK/WAIT=%" PRIu32 "/%" PRIu32
+                 ", WAIT=%" PRIu64 ".%02" PRIu64
+                 "%%",
+                 name,
+                 (request & 0x01U) != 0U ? "AP" : "DP",
+                 (request & 0x02U) != 0U ? "read" : "write",
+                 request & 0x0CU,
+                 attempts, stats->request_ok_count[request],
+                 stats->request_wait_count[request],
+                 request_wait_percent / 100U, request_wait_percent % 100U);
+    }
+}
+#endif
+
 void app_main(void)
 {
     static const char *TAG = "main";
@@ -112,6 +299,10 @@ void app_main(void)
     bool safe_to_resume = true;
     transfer_stats_t write_stats = {};
     transfer_stats_t read_stats = {};
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+    swd_profile_stats_t write_profile = {};
+    swd_profile_stats_t read_profile = {};
+#endif
     uint32_t attempted = 0;
     uint32_t verified = 0;
     uint32_t write_failures = 0;
@@ -126,6 +317,27 @@ void app_main(void)
              ", block=%u bytes, iterations=%" PRIu32,
              address, address + (uint32_t)block_size - 1U,
              (unsigned)block_size, iterations);
+#ifdef CONFIG_ESP_SWD_PHY_AXC2T245
+    ESP_LOGI(TAG,
+             "SWD config: clock=%d Hz, turnaround=%u ns, idle=%u cycles, "
+             "dedicated GPIO=%s",
+             CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ,
+             CONFIG_ESP_SWD_TURNAROUND_DELAY_US * 1000U +
+                 CONFIG_ESP_SWD_TURNAROUND_DELAY_NS,
+             CONFIG_ESP_SWD_IDLE_CYCLES,
+#ifdef CONFIG_ESP_SWD_USE_DEDICATED_GPIO
+             "yes"
+#else
+             "no"
+#endif
+    );
+#endif
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+    ESP_LOGW(TAG,
+             "SWD cycle instrumentation enabled at %u MHz; profiler bookkeeping "
+             "reduces measured throughput",
+             CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
+#endif
 
     if ((block_size == 0) || (address > UINT32_MAX - block_size)) {
         ESP_LOGE(TAG, "Invalid target RAM range");
@@ -169,6 +381,8 @@ void app_main(void)
             goto cleanup;
         }
     }
+    ESP_LOGI(TAG, "Target was %s; stress test runs with target halted",
+             target_was_halted ? "halted" : "running");
 
     if (!swd_read_memory(address, original, block_size)) {
         ESP_LOGE(TAG, "Failed to back up target RAM; stress test not started");
@@ -180,9 +394,25 @@ void app_main(void)
         fill_pattern(write_buffer, block_size, iteration);
         attempted++;
 
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        swd_perf_reset_counters();
+#endif
         int64_t started_us = esp_timer_get_time();
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        const uint32_t write_started_cycles = esp_cpu_get_cycle_count();
+#endif
         const bool write_ok = swd_write_memory(address, write_buffer, block_size) != 0;
-        const uint64_t write_us = (uint64_t)(esp_timer_get_time() - started_us);
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        const uint32_t write_cycles =
+            esp_cpu_get_cycle_count() - write_started_cycles;
+#endif
+        const int64_t finished_us = esp_timer_get_time();
+        const uint64_t write_us = (uint64_t)(finished_us - started_us);
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        swd_perf_counters_t profile_sample;
+        swd_perf_get_counters(&profile_sample);
+        record_swd_profile(&write_profile, &profile_sample, write_cycles);
+#endif
 
         if (!write_ok) {
             write_failures++;
@@ -198,9 +428,23 @@ void app_main(void)
         record_transfer(&write_stats, block_size, write_us);
 
         memset(read_buffer, 0xa5, block_size);
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        swd_perf_reset_counters();
+#endif
         started_us = esp_timer_get_time();
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        const uint32_t read_started_cycles = esp_cpu_get_cycle_count();
+#endif
         const bool read_ok = swd_read_memory(address, read_buffer, block_size) != 0;
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        const uint32_t read_cycles =
+            esp_cpu_get_cycle_count() - read_started_cycles;
+#endif
         const uint64_t read_us = (uint64_t)(esp_timer_get_time() - started_us);
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+        swd_perf_get_counters(&profile_sample);
+        record_swd_profile(&read_profile, &profile_sample, read_cycles);
+#endif
 
         if (!read_ok) {
             read_failures++;
@@ -257,6 +501,10 @@ void app_main(void)
              mismatch_iterations, mismatched_bytes, recovery_failures);
     log_rate(TAG, "Write", &write_stats);
     log_rate(TAG, "Read", &read_stats);
+#ifdef CONFIG_ESP_SWD_PERF_INSTRUMENTATION
+    log_swd_profile(TAG, "Write", &write_profile);
+    log_swd_profile(TAG, "Read", &read_profile);
+#endif
 
 cleanup:
     if (connected && backup_valid) {

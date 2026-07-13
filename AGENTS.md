@@ -120,15 +120,19 @@ worked, but operation stopped while reading RAM, so zero is not usable on the
 current hardware. A 250 ns guard works and compiles to a minimum 60-cycle wait
 at 240 MHz. Performance remains below the remembered pre-translator rate.
 
-The demo now selects `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1` as an explicit YOLO
-mode. It selects the existing `SWD_TransferFast()` path, whose
+The defaults now select `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1` as an explicit
+YOLO mode. It selects the existing `SWD_TransferFast()` path, whose
 `PIN_DELAY_FAST()` emits no delay instructions. The JTAG-to-SWD and generic SWD
 sequence helpers retain their minimum one-cycle delay because the original
 fully unpaced dedicated build failed during JTAG-to-SWD entry. The separate
 translator ownership guards remain active. `sdkconfig.defaults` retains the
-confirmed 250 ns value, but the user-modified generated `sdkconfig` currently
-selects 50 ns; that 50 ns value is not hardware-confirmed here. YOLO mode has
-built but has not yet been tested on hardware.
+confirmed 250 ns value. The user later reported that a working unpaced build
+did not materially improve the roughly 200 KB/s result; no complete YOLO log
+was retained here. At the start of profiling on 2026-07-13, the generated
+`sdkconfig` selected a paced 32 MHz clock. It initially had a 1 us guard, then
+the user selected the hardware-confirmed 250 ns guard before capturing the
+baseline below. Preserve and report generated values when comparing results;
+changing only `sdkconfig.defaults` does not update an existing configuration.
 
 ## Confirmed Rev 6 GPIO map
 
@@ -166,6 +170,7 @@ CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1
 CONFIG_ESP_SWD_TURNAROUND_DELAY_US=0
 CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=250
 CONFIG_ESP_SWD_USE_DEDICATED_GPIO=y
+CONFIG_ESP_SWD_PERF_INSTRUMENTATION=y
 ```
 
 If a generated `sdkconfig` or an existing build directory is present, changing
@@ -456,6 +461,249 @@ Stability counters include:
 - total mismatched bytes;
 - SWD recovery failures.
 
+### Dedicated-GPIO cycle profiler
+
+`CONFIG_ESP_SWD_PERF_INSTRUMENTATION` enables diagnostic counters around the
+existing SWD implementation. The demo enables it in `sdkconfig.defaults`, but
+the component's own Kconfig default is off. Disable it for final throughput and
+long stability runs because its counter updates execute in the hot path.
+
+For every measured 8 KiB API call, the demo resets the counters immediately
+before timing and snapshots them immediately after timing. Write and read
+profiles therefore remain separate. The profiler records:
+
+- CPU cycles for the complete `swd_write_memory()` or `swd_read_memory()` call;
+- cycles inside physical `SWD_Transfer()` attempts;
+- protocol read and write attempt counts and cycle totals;
+- target-drive and host-drive ownership-helper cycles and call counts;
+- OK, WAIT, FAULT, parity/protocol-error, and invalid ACK outcomes;
+- separate cycle totals for every ACK outcome;
+- attempts, OK, and WAIT bucketed by DP/AP, read/write, and A[3:2];
+- logical transfer count and consecutive-WAIT streak distribution;
+- minimum and maximum physical-transfer cycle counts.
+
+Pattern generation, buffer clearing, byte comparison, logging, recovery, and
+the inter-iteration task delay remain outside the measurements. The physical
+transfer timing stops before its own aggregate-counter update, while the outer
+API timing includes all profiler bookkeeping. The reported `avg outside` value
+therefore includes both higher-level memory-loop work and the profiler's own
+per-transfer aggregate update.
+
+The first hardware profile was captured with:
+
+```text
+CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=32000000
+CONFIG_ESP_SWD_TURNAROUND_DELAY_US=0
+CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=250
+CONFIG_ESP_SWD_IDLE_CYCLES=0
+CONFIG_ESP_SWD_USE_DEDICATED_GPIO=y
+CONFIG_ESP_SWD_PERF_INSTRUMENTATION=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+```
+
+The DP IDCODE was `0x6ba02477`. This is not enough to identify the exact target
+MCU, which was not recorded. All 100 iterations verified, target RAM was
+restored, and no transfer, mismatch, or recovery failures occurred.
+
+Measured baseline:
+
+```text
+Write: 209.95 KB/s average, 208.62 minimum, 211.57 maximum
+Read:  179.97 KB/s average, 179.86 minimum, 180.07 maximum
+Write: 656986 attempts, 206400 OK, 450586 WAIT
+Read:  822335 attempts, 206400 OK, 615935 WAIT
+Write U5: target/host 212.42/219.11 cycles, 32.45% of SWD cycles
+Read U5:  target/host 212.39/218.88 cycles, 34.83% of SWD cycles
+```
+
+WAIT represented 68.58% of write attempts and 74.90% of read attempts. Each
+OK therefore required 3.1831 physical attempts for writes and 3.9842 for
+reads. The exact 206400 OK count is 2064 successful protocol transfers per
+8 KiB call, matching the block implementation's 2048 data words plus TAR and
+RDBUFF operations at each 1 KiB boundary. The outer memory code and profiler
+bookkeeping represented only 6.70% of write call cycles and 6.79% of read call
+cycles. The immediate WAIT retry loop is therefore the first optimization
+target; high-level batching is already doing the expected minimum work.
+
+`CONFIG_ESP_SWD_IDLE_CYCLES` now exposes the existing CMSIS-DAP post-success
+idle clocks. It ranges from 0 through 255 and is separate from the 250 ns U5
+turnaround guard. The enhanced profiler also reports OK/WAIT cycle costs,
+request classes, and WAIT streaks.
+
+The enhanced zero-idle build was then run on the same hardware. The target was
+running when attached and was halted for the stress test. All 100 iterations
+verified and RAM restoration succeeded. The additional profiler bookkeeping
+changed request cadence, so compare this diagnostic run with the earlier
+aggregate-profiler run rather than treating its KB/s as uninstrumented speed:
+
+```text
+Write: 215.32 KB/s, 619715 attempts, 206400 OK, 413315 WAIT
+Read:  179.87 KB/s, 805672 attempts, 206400 OK, 599272 WAIT
+Write ACK cost: OK 2172.76 cycles, WAIT 940.93 cycles
+Read ACK cost:  OK 2125.04 cycles, WAIT 941.26 cycles
+Write WAIT streaks 0/1/2/3/4-7/8+: 2416/1457/198414/3313/800/0
+Read WAIT streaks 0/1/2/3/4-7/8+:  800/192/17144/188264/0/0
+```
+
+WAIT attempts consumed approximately 46.44% of write SWD cycles and 56.26%
+of read SWD cycles. Ordinary AP DRW writes averaged 1.9933 WAITs per OK and
+96.13% of all logical write-side transfers had exactly two WAITs. AP DRW reads
+averaged 2.9148 WAITs per OK; 91.21% of read-side logical transfers had exactly
+three WAITs and 8.31% had two. TAR writes had no WAITs. The write-side final
+DP RDBUFF checks averaged 6.3637 WAITs, but there were only 800 of them versus
+204800 AP DRW writes.
+
+Compared with the earlier zero-idle aggregate profile, the enhanced profiler's
+extra pacing reduced write WAITs from 450586 to 413315 and increased measured
+write throughput from 209.95 to 215.32 KB/s. Read WAITs also fell from 615935
+to 599272 while read throughput stayed effectively flat. This is direct
+evidence that request timing can trade cheap delay for fewer full WAIT
+transactions, but it did not establish that more post-success idle clocks would
+monotonically reduce WAITs.
+
+The same enhanced-profiler build was subsequently tested at 2, 4, and 8 idle
+cycles. Every run completed 100 verified iterations without transfer failures,
+mismatches, or RAM-restore failures:
+
+```text
+idle  write KB/s  read KB/s  combined KB/s  write WAIT  read WAIT  write/read OK cycles
+   0      215.32     179.87         196.01      413315     599272  2172.76/2125.04
+   2      212.95     205.68         209.25      411361     454921  2231.49/2183.83
+   4      210.31     191.82         200.64      411010     510151  2289.80/2242.22
+   8      205.18     177.43         190.30      410292     567278  2406.30/2357.76
+```
+
+The combined number is the harmonic mean for equal-size write and read blocks.
+Relative to idle 0, idle 2 reduced write throughput by 1.10%, increased read
+throughput by 14.35%, and improved combined throughput by 6.76%. Idle 4 retained
+only a 2.36% combined improvement, while idle 8 was 2.91% slower. Each added
+idle clock increased successful-transfer cost by approximately 29.2 through
+29.4 CPU cycles. Read WAITs were non-monotonic: 599272, 454921, 510151, then
+567278. The measurements therefore disprove the simple model that increasing
+post-success idle always gives the target more useful completion time. The
+exact cause of the cadence-sensitive read behavior is not established by these
+ESP-side counters.
+
+The earlier aggregate-profiler code was also checked in two isolated build
+directories before the ACK/request/streak counters were added:
+
+- translated regular GPIO with profiling enabled built successfully;
+- dedicated GPIO with profiling disabled built successfully;
+- the dedicated profiled `SWD_Transfer()` grew from `0x735` to `0x7f6` bytes;
+- target/host ownership helpers grew from `0x6e`/`0x81` to `0x8f`/`0xa3`
+  bytes respectively.
+
+Do not optimize the ownership helpers until the idle-cycle experiment has
+established whether expensive WAIT attempts can be replaced by idle clocks
+without U5 ownership changes. After that, three evidence-backed experiments
+are available for separate A/B tests:
+
+1. Put U5 `/OE` and `DIR1` in the existing dedicated output bundle. ESP32-S3
+   has eight dedicated output channels per CPU and the current bundle uses two.
+2. Keep GPIO8 input-enable fixed instead of toggling it during ownership. The
+   ESP32-S3 HAL and TRM treat pad input-enable and output-enable as independent;
+   only output-enable controls whether GPIO8 drives. GPIO18 is the actual SWDIO
+   input. Verify this change electrically before retaining it.
+3. Stop rewriting `DIR2` on every ownership change. Normal SWD leaves it low,
+   so initialize it once and retain that state.
+
+Do not combine these changes initially, or the cycle profile will not identify
+which one helped.
+
+Official dedicated-GPIO reference:
+
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/dedic_gpio.html
+
+## RMT and SPI accelerator feasibility
+
+These options were reviewed against the ESP32-S3 ESP-IDF peripheral APIs and
+the Rev 6 translator wiring. Neither backend has been implemented. Treat the
+following as an architecture assessment, not measured performance.
+
+### RMT
+
+The ESP32-S3 RMT peripheral can transmit level-duration symbols and ESP-IDF can
+synchronize multiple TX channels. In principle, one TX channel could generate
+SWCLK while a second generates host SWDIO. This does not map cleanly onto a
+complete SWD transaction:
+
+- every request must stop for the host-to-target turnaround and three-bit ACK;
+- the ACK determines whether a read data phase, write data phase, WAIT retry,
+  FAULT handling, or idle clocks follow;
+- Rev 6 must isolate U5, change `DIR1`, and disable or enable the GPIO8 pad
+  output driver between those phases;
+- RMT RX records level-duration symbols. It does not directly sample SWDIO on
+  externally defined SWCLK edges;
+- RMT cannot dynamically tri-state GPIO8 or operate U5 `/OE` and `DIR1` as a
+  conditional per-symbol side effect.
+
+A two-channel RMT design would therefore consist of many short queued segments
+with CPU intervention at every turnaround and ACK. The stock driver queues TX
+transactions and reports completion through an ISR, so that setup and
+synchronization overhead is likely to dominate a roughly 46-bit SWD transfer.
+A direct-register implementation could reduce driver overhead but would still
+need the same CPU-controlled barriers and a separate input sampling solution.
+
+Conclusion: RMT is technically usable for a waveform experiment, but it is not
+a promising throughput backend for this split-direction SWD link.
+
+Official ESP-IDF references:
+
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html#start-transmission-simultaneously
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html#initiate-tx-transaction
+
+### SPI
+
+SPI is a closer electrical match because the Rev 6 host-side signals are
+already separate: GPIO6 can be SCLK, GPIO8 MOSI, GPIO18 MISO, and active-low
+GPIO15 `/OE` can be SPI CS. GPIO17 `DIR1` still has to be controlled in
+software. A candidate backend would use SPI mode 0, LSB-first bit order, no
+DMA, polling transactions, an acquired bus, and automatic dummy insertion
+disabled.
+
+It cannot be one ordinary half-duplex SPI transaction. SWD requires at least
+these CPU-separated phases:
+
+```text
+TX request -> CS high/SWCLK low -> isolate and turn targetward
+RX ACK and optional read data -> CS high/SWCLK low -> isolate and turn hostward
+optional TX write data -> host idle
+```
+
+The target ACK determines the next phase. Reads can potentially clock a fixed
+ACK-plus-data receive phase if WAIT/FAULT dummy-data behavior is deliberately
+matched. Writes still require a later transmit phase after ACK. The SPI
+driver's `cs_ena_pretrans` field is expressed in SPI clock cycles and could
+provide the settling guard after `/OE` is asserted, but the guard after `/OE`
+is deasserted and before changing `DIR1` still needs a CPU cycle-counter wait.
+
+There are additional details to prove before implementation:
+
+- ESP32-S3 has documented restrictions for TX lengths congruent to one modulo
+  eight, so the 33 data-plus-parity bits need a verified framing strategy;
+- automatic dummy bits must remain off because every extra SCLK edge is an SWD
+  clock and changes protocol state;
+- disabling dummy compensation means the real translator, trace, and MISO
+  input delay still limits the usable SPI clock;
+- stock `spi_device_polling_transmit()` overhead is documented at roughly 9 us
+  for a one-byte polling transaction under Espressif's example conditions.
+  Two or three driver transactions per SWD word are therefore unlikely to beat
+  the current approximately 20 us/word observed at 200 KB/s.
+
+Conclusion: do not expect the stock SPI master driver to improve throughput. A
+specialized SPI2 backend that preconfigures registers and directly starts and
+polls each short phase remains a plausible later experiment, after dedicated
+GPIO profiling identifies the actual cycle budget. It must retain explicit U5
+ownership transitions and be tested for protocol framing and electrical
+settling rather than inferred from SPI clock rate.
+
+Official ESP-IDF references:
+
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#spi-transactions
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#transactions-with-integers-other-than-uint8-t
+- https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#transfer-speed-considerations
+
 ## Build evidence and commands
 
 The implementation was compiled with ESP-IDF v6.0.2 from:
@@ -470,6 +718,11 @@ successfully after the delay implementation. The later CPU-cycle clock-pacing
 fix builds with both dedicated and regular translated GPIO under ESP-IDF
 v6.0.2.
 
+The enhanced ACK/request/streak profiler and zero-idle configuration also built
+successfully on 2026-07-13 with ESP-IDF v6.0.2 from
+`/home/jackson/esp/esp-idf`. This is compile evidence only; the enhanced
+profiler still needs a hardware run.
+
 Typical setup on the original machine:
 
 ```sh
@@ -481,7 +734,7 @@ Use the ESP-IDF path installed on the new machine. Prefer a fresh build
 directory when comparing configurations, and verify the generated config:
 
 ```sh
-rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|DEFAULT_CLOCK_HZ|TURNAROUND_DELAY_(US|NS))|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
+rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|DEFAULT_CLOCK_HZ|TURNAROUND_DELAY_(US|NS)|IDLE_CYCLES|PERF_INSTRUMENTATION)|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
 ```
 
 Useful object-code check for the dedicated backend:
@@ -496,21 +749,29 @@ The exact build paths can differ by ESP-IDF/CMake version.
 
 ## Next hardware-debugging steps
 
-Run the unpaced YOLO build on Rev 6 and record the full serial log. For an
-isolated comparison against the confirmed result, use the 250 ns default. The
-generated `sdkconfig` currently selects 50 ns instead, so a run of the current
-artifact changes both SWCLK pacing and turnaround timing. The remaining
-questions are whether the fast transfer path stays stable through the RAM
-stress test and what throughput it actually achieves.
+Keep the configured 32 MHz SWD clock, 250 ns translator guard, dedicated GPIO,
+240 MHz CPU, RAM range, block size, and iteration count fixed. Enhanced-profiler
+runs for idle 0, 2, 4, and 8 are complete. Do not continue upward: test idle 1
+and 3 to bracket the measured idle-2 optimum. Do not convert the requested
+32 MHz directly into a presumed 31.25 ns software-bit-banged idle clock; the
+observed successful-transfer costs show approximately 29.3 CPU cycles per
+added idle clock in this build.
 
-If it remains stable:
+The generated `sdkconfig`, rather than `sdkconfig.defaults`, controls the
+actual run. Record the complete startup configuration, target initial halt
+state, throughput, ACK cost, request-class lines, and WAIT streak histogram for
+each value. The useful setting is the one that reduces WAIT attempts enough to
+offset its extra idle clocks; do not select a value from WAIT count alone.
 
-1. Record the DP IDCODE.
-2. Run the default 100-iteration stress test.
-3. Save write/read average, minimum, maximum KB/s and all stability counters.
-4. Repeat with regular translated GPIO using the same CPU frequency, SWD clock,
-   target, block, and iterations.
-5. Only then vary the delay or SWD clock.
+After the idle-1 and idle-3 diagnostic runs:
+
+1. Disable `CONFIG_ESP_SWD_PERF_INSTRUMENTATION` and compare idle 0, 1, 2, and
+   3, because profiler bookkeeping itself changes request cadence.
+2. Run the 100-iteration stability test on the fastest uninstrumented setting.
+3. Compare translated regular GPIO by changing only the dedicated-GPIO option.
+4. If idle clocks do not help, test a delay after WAIT separately instead of
+   changing the electrical turnaround guard.
+5. Only then A/B the U5 helper changes listed above, one at a time.
 
 For a fair regular-vs-dedicated comparison, change only:
 
@@ -588,7 +849,8 @@ These were identified but were not treated as blockers for the minimal demo:
 7. The component README may contain historical wording saying the top-level
    Soul Injector project lacks Rev 6 defaults. The top-level project was updated
    afterward; verify and refresh that paragraph if maintaining the docs.
-8. Unpaced YOLO transfer mode has not yet been tested on hardware.
+8. A working unpaced YOLO build was reported not to improve throughput
+   materially, but its complete configuration and profile were not retained.
 
 ## Working rules for the next Codex instance
 
