@@ -1,0 +1,33 @@
+menu "SWD RAM stress test"
+
+    config SWD_DEMO_RAM_ADDRESS
+        hex "Target RAM test address"
+        default 0x20000000
+        help
+            Start address of a writable target RAM region. The demo backs up
+            and restores this region, but the target must not use it while the
+            stress test is running.
+
+    config SWD_DEMO_BLOCK_SIZE
+        int "Transfer block size (bytes)"
+        range 4 65536
+        default 8192
+        help
+            Number of bytes transferred by each measured read or write.
+
+    config SWD_DEMO_ITERATIONS
+        int "Stress-test iterations"
+        range 1 1000000
+        default 100
+        help
+            Number of write, read, and byte-for-byte verification cycles.
+
+    config SWD_DEMO_PROGRESS_INTERVAL
+        int "Progress report interval"
+        range 1 1000000
+        default 10
+        help
+            Print cumulative performance and stability statistics after this
+            many iterations.
+
+endmenu
