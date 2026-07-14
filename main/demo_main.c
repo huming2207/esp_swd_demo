@@ -224,7 +224,7 @@ static void log_swd_profile(const char *tag, const char *name,
              average_transfer_ns,
              stats->min_transfer_cycles, stats->max_transfer_cycles);
     ESP_LOGI(tag,
-             "%s U5: target/host=%" PRIu64 ".%02" PRIu64
+             "%s translator: target/host=%" PRIu64 ".%02" PRIu64
              "/%" PRIu64 ".%02" PRIu64
              " cycles/change, ownership=%" PRIu64 ".%02" PRIu64
              "%% of SWD; ACK OK/WAIT/FAULT/error/invalid=%" PRIu32
@@ -311,7 +311,7 @@ void app_main(void)
     uint64_t mismatched_bytes = 0;
     uint32_t recovery_failures = 0;
 
-    ESP_LOGI(TAG, "Soul Injector Rev 6 SWD GPIO stress test");
+    ESP_LOGI(TAG, "Soul Injector Rev 6 SWD transport stress test");
     ESP_LOGI(TAG,
              "RAM range: 0x%08" PRIx32 "..0x%08" PRIx32
              ", block=%u bytes, iterations=%" PRIu32,
@@ -319,13 +319,30 @@ void app_main(void)
              (unsigned)block_size, iterations);
 #ifdef CONFIG_ESP_SWD_PHY_AXC2T245
     ESP_LOGI(TAG,
-             "SWD config: clock=%d Hz, turnaround=%u ns, idle=%u cycles, "
-             "dedicated GPIO=%s",
+             "SWD config: clock=%d Hz, fast pad=%u NOPs/half-cycle%s, "
+             "turnaround=%u ns, idle=%u cycles, dedicated GPIO=%s, "
+             "dedicated translator controls=%s, direct SPI2=%s",
              CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ,
+             CONFIG_ESP_SWD_FAST_DELAY_NOPS,
+#ifdef CONFIG_ESP_SWD_USE_SPI
+             " (unused by SPI)",
+#else
+             "",
+#endif
              CONFIG_ESP_SWD_TURNAROUND_DELAY_US * 1000U +
-                 CONFIG_ESP_SWD_TURNAROUND_DELAY_NS,
+             CONFIG_ESP_SWD_TURNAROUND_DELAY_NS,
              CONFIG_ESP_SWD_IDLE_CYCLES,
 #ifdef CONFIG_ESP_SWD_USE_DEDICATED_GPIO
+             "yes",
+#else
+             "no",
+#endif
+#ifdef CONFIG_ESP_SWD_DEDICATED_TRANSLATOR_CONTROLS
+             "yes",
+#else
+             "no",
+#endif
+#ifdef CONFIG_ESP_SWD_USE_SPI
              "yes"
 #else
              "no"

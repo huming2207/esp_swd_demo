@@ -120,19 +120,31 @@ worked, but operation stopped while reading RAM, so zero is not usable on the
 current hardware. A 250 ns guard works and compiles to a minimum 60-cycle wait
 at 240 MHz. Performance remains below the remembered pre-translator rate.
 
-The defaults now select `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1` as an explicit
-YOLO mode. It selects the existing `SWD_TransferFast()` path, whose
-`PIN_DELAY_FAST()` emits no delay instructions. The JTAG-to-SWD and generic SWD
-sequence helpers retain their minimum one-cycle delay because the original
-fully unpaced dedicated build failed during JTAG-to-SWD entry. The separate
-translator ownership guards remain active. `sdkconfig.defaults` retains the
-confirmed 250 ns value. The user later reported that a working unpaced build
-did not materially improve the roughly 200 KB/s result; no complete YOLO log
-was retained here. At the start of profiling on 2026-07-13, the generated
-`sdkconfig` selected a paced 32 MHz clock. It initially had a 1 us guard, then
-the user selected the hardware-confirmed 250 ns guard before capturing the
-baseline below. Preserve and report generated values when comparing results;
-changing only `sdkconfig.defaults` does not update an existing configuration.
+The generated configuration was later changed to
+`CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1`. A zero-padding capture proved that
+back-to-back dedicated-GPIO clock writes are not usable on this board: only
+4 ns and 5 ns low pulses were observable at the logic-analyzer probe before
+the first transfer stopped decoding and the target did not reply. Fast mode
+now has `CONFIG_ESP_SWD_FAST_DELAY_NOPS`; four NOPs after each SWCLK transition
+completed the 100-iteration stress test. Setup sequences retain cycle-counter
+pacing, and the separate 250 ns translator guards remain active.
+
+The four-NOP run did not improve throughput because its faster retries caused
+more target WAIT responses. The current pending hardware A/B puts the SWDIO
+translator `/OE`, `DIR1`, and `DIR2` pins in the existing dedicated output
+bundle behind `CONFIG_ESP_SWD_DEDICATED_TRANSLATOR_CONTROLS`. It is
+compile-checked but not yet hardware-validated. Preserve and report generated
+values when comparing results; changing only `sdkconfig.defaults` does not
+update an existing configuration.
+
+Three direct-RMT waveform experiments were subsequently attempted. None
+reached a working IDCODE transaction, and the user restored the component to
+the last working dedicated-GPIO state. The RMT source was removed. The current
+experiment is a direct SPI2 HAL/LL backend at 10 MHz, described below. Two
+hardware runs reached a target-generated OK response but failed to decode it in
+SPI2 RX. The latest receive realignment is uncompiled and unmeasured. Do not
+describe the SPI backend as working until it reads IDCODE and completes the RAM
+test.
 
 ## Confirmed Rev 6 GPIO map
 
@@ -141,15 +153,15 @@ the firmware defaults exactly:
 
 | ESP32-S3 GPIO | Firmware signal | Hardware function |
 | --- | --- | --- |
-| GPIO4 | `SWCLK_nOE` | Active-low shared output enable for U7 |
-| GPIO5 | `HOST_SWBOOT` | U7 A2, target BOOT channel |
-| GPIO6 | `HOST_SWCLK` | U7 A1, target SWCLK channel |
+| GPIO4 | `SWCLK_nOE` | Active-low shared output enable for the SWCLK/BOOT translator |
+| GPIO5 | `HOST_SWBOOT` | SWCLK/BOOT translator A2, target BOOT channel |
+| GPIO6 | `HOST_SWCLK` | SWCLK/BOOT translator A1, target SWCLK channel |
 | GPIO7 | `HOST_SW_RST` | Gate drive for target reset pull-down MOSFET |
-| GPIO8 | `HOST_SWDATA_OUT` | U5 A1, host-to-target SWDIO data |
-| GPIO15 | `SWDATA_nOE` | Active-low U5 output enable |
-| GPIO16 | `SWDATA_DIR2` | U5 channel 2 direction; held low |
-| GPIO17 | `SWDATA_DIR1` | U5 channel 1 direction |
-| GPIO18 | `HOST_SWDATA_IN` | U5 A2, target-to-host SWDIO sample |
+| GPIO8 | `HOST_SWDATA_OUT` | SWDIO translator A1, host-to-target SWDIO data |
+| GPIO15 | `SWDATA_nOE` | Active-low SWDIO translator output enable |
+| GPIO16 | `SWDATA_DIR2` | SWDIO translator channel 2 direction; held low |
+| GPIO17 | `SWDATA_DIR1` | SWDIO translator channel 1 direction |
+| GPIO18 | `HOST_SWDATA_IN` | SWDIO translator A2, target-to-host SWDIO sample |
 
 The active demo defaults in `sdkconfig.defaults` are:
 
@@ -166,10 +178,14 @@ CONFIG_ESP_SWD_DATA_DIR2_PIN=16
 CONFIG_ESP_SWD_CLK_NOE_PIN=4
 CONFIG_ESP_SWD_NRST_PIN=7
 CONFIG_ESP_SWD_BOOT_PIN=5
-CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=-1
+CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=10000000
+CONFIG_ESP_SWD_FAST_DELAY_NOPS=4
 CONFIG_ESP_SWD_TURNAROUND_DELAY_US=0
 CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=250
+CONFIG_ESP_SWD_IDLE_CYCLES=1
 CONFIG_ESP_SWD_USE_DEDICATED_GPIO=y
+CONFIG_ESP_SWD_DEDICATED_TRANSLATOR_CONTROLS=y
+CONFIG_ESP_SWD_USE_SPI=y
 CONFIG_ESP_SWD_PERF_INSTRUMENTATION=y
 ```
 
@@ -180,9 +196,10 @@ built.
 
 ## Rev 6 translator wiring and truth table
 
-### U5: SWDIO translator
+### SWDIO translator
 
-U5 is an SN74AXC2T245 with both B-side pins connected to target SWDIO:
+The SWDIO translator is an SN74AXC2T245 with both B-side pins connected to
+target SWDIO:
 
 - A1 is `HOST_SWDATA_OUT` on GPIO8.
 - B1 reaches target SWDIO through 47 ohms.
@@ -202,13 +219,14 @@ Firmware modes:
 
 | Mode | `/OE` | DIR1 | DIR2 | Result |
 | --- | --- | --- | --- | --- |
-| Isolated | high | do not care | do not care | No U5 port drives |
+| Isolated | high | do not care | do not care | No translator port drives |
 | Host owns SWDIO | low | high | low | A1 drives target; A2 senses target |
 | Target owns SWDIO | low | low | low | Target is passed to A1/A2; GPIO8 is input/high-Z |
 
 During target ownership, GPIO8's ESP32 output is disabled before DIR1 changes
-to low and before U5 is re-enabled. During host ownership, the first outgoing
-bit is preloaded while U5 is disabled, then the ESP output and U5 are enabled.
+to low and before the translator is re-enabled. During host ownership, the
+first outgoing bit is preloaded while the translator is disabled, then the ESP
+output and translator are enabled.
 
 Official component reference:
 
@@ -218,18 +236,18 @@ The data sheet documents a typical 71 kohm internal pull-down on each data I/O
 and recommends an external pull-up of 7 kohm or less when a high default is
 needed. Rev 6 uses a 4.7 kohm target SWDIO pull-up, which is appropriate.
 
-### U7: SWCLK and BOOT translator
+### SWCLK and BOOT translator
 
-U7 is another SN74AXC2T245:
+The SWCLK and BOOT translator is another SN74AXC2T245:
 
 - A1 is GPIO6 `HOST_SWCLK`; B1 is target SWCLK through 47 ohms.
 - A2 is GPIO5 `HOST_SWBOOT`; B2 is target BOOT.
 - Both direction pins are hard-pulled high, so both channels are A to B.
 - GPIO4 controls their shared active-low `/OE`.
 
-Firmware preloads SWCLK low and BOOT low before U7 is enabled. Normal Rev 6 SWD
-therefore keeps target BOOT low. The shared `/OE` is safe for ordinary SWD as
-long as this BOOT-low policy is intentional.
+Firmware preloads SWCLK low and BOOT low before the translator is enabled.
+Normal Rev 6 SWD therefore keeps target BOOT low. The shared `/OE` is safe for
+ordinary SWD as long as this BOOT-low policy is intentional.
 
 There is currently no Rev 6 BOOT-high rescue sequence. This differs from the
 older direct-GPIO behavior that asserted BOOT during connection. If a target
@@ -266,16 +284,16 @@ ports isolate. That is safe but SWD cannot work.
 
 Confirmed passive defaults:
 
-- U5 and U7 `/OE` have 47 kohm pull-ups and start disabled.
-- U5 DIR1 and DIR2 have 47 kohm pull-downs.
-- U7 direction inputs have 47 kohm pull-ups.
+- Both translators' `/OE` pins have 47 kohm pull-ups and start disabled.
+- The SWDIO translator's DIR1 and DIR2 have 47 kohm pull-downs.
+- The SWCLK/BOOT translator's direction inputs have 47 kohm pull-ups.
 - Target SWCLK has a 47 kohm pull-down.
 - Target SWDIO has a 4.7 kohm pull-up to VPP.
 - Reset MOSFET gate has a 100 kohm pull-down.
 - Target reset has a 47 kohm pull-up to VPP.
 
 The firmware also writes safe GPIO latch values before configuring ESP32 pins
-as outputs and isolates U5/U7 in `swd_off()`.
+as outputs and isolates both translators in `swd_off()`.
 
 ## SWD ownership and protocol audit
 
@@ -333,11 +351,11 @@ Every SWDIO ownership change now performs:
 
 ```text
 1. Force SWCLK low.
-2. Raise U5 /OE (isolate U5).
+2. Raise the SWDIO translator /OE (isolate the translator).
 3. For target ownership, immediately disable the GPIO8 ESP output.
 4. Busy-wait the configured microsecond plus nanosecond guard.
 5. Change DIR1/DIR2 and configure/preload the ESP output as required.
-6. Lower U5 /OE.
+6. Lower the SWDIO translator /OE.
 7. Busy-wait the same guard.
 8. Resume the existing SWD clock sequence.
 ```
@@ -512,8 +530,8 @@ Write: 209.95 KB/s average, 208.62 minimum, 211.57 maximum
 Read:  179.97 KB/s average, 179.86 minimum, 180.07 maximum
 Write: 656986 attempts, 206400 OK, 450586 WAIT
 Read:  822335 attempts, 206400 OK, 615935 WAIT
-Write U5: target/host 212.42/219.11 cycles, 32.45% of SWD cycles
-Read U5:  target/host 212.39/218.88 cycles, 34.83% of SWD cycles
+Write translator: target/host 212.42/219.11 cycles, 32.45% of SWD cycles
+Read translator:  target/host 212.39/218.88 cycles, 34.83% of SWD cycles
 ```
 
 WAIT represented 68.58% of write attempts and 74.90% of read attempts. Each
@@ -526,9 +544,9 @@ cycles. The immediate WAIT retry loop is therefore the first optimization
 target; high-level batching is already doing the expected minimum work.
 
 `CONFIG_ESP_SWD_IDLE_CYCLES` now exposes the existing CMSIS-DAP post-success
-idle clocks. It ranges from 0 through 255 and is separate from the 250 ns U5
-turnaround guard. The enhanced profiler also reports OK/WAIT cycle costs,
-request classes, and WAIT streaks.
+idle clocks. It ranges from 0 through 255 and is separate from the 250 ns
+translator turnaround guard. The enhanced profiler also reports OK/WAIT cycle
+costs, request classes, and WAIT streaks.
 
 The enhanced zero-idle build was then run on the same hardware. The target was
 running when attached and was halted for the stress test. All 100 iterations
@@ -584,6 +602,42 @@ post-success idle always gives the target more useful completion time. The
 exact cause of the cadence-sensitive read behavior is not established by these
 ESP-side counters.
 
+### Fast-path capture and four-NOP result
+
+The zero-padding fast-mode capture files were:
+
+```text
+/media/jackson/Ventoy/decoder--260713-163054.csv
+/media/jackson/Ventoy/DSLogic U3Pro32-la-260713-163054.csv
+```
+
+The raw capture has a 1 GHz sample rate. The decoder reached the first
+`RDBUFF`, then reported `NOREPLY`. At the measured SWCLK point, the first fast
+transfer contained observable low pulses of 4 ns and 5 ns before SWCLK stayed
+high while SWDIO continued changing. The analyzer channel-to-schematic probe
+mapping was not recorded, so this establishes waveform collapse at the probe
+but does not by itself locate it on the A or B side of the SWCLK/BOOT
+translator.
+
+`CONFIG_ESP_SWD_FAST_DELAY_NOPS=4` restored operation with fast mode, idle 1,
+the 250 ns guard, dedicated GPIO, and profiling enabled. All 100 iterations
+verified and RAM restoration succeeded:
+
+```text
+Write: 210.03 KB/s, 821095 attempts, 206400 OK, 614695 WAIT
+Read:  190.10 KB/s, 938499 attempts, 206400 OK, 732099 WAIT
+Write ACK cost: OK 1739.60 cycles, WAIT 785.06 cycles
+Read ACK cost:  OK 1729.62 cycles, WAIT 786.23 cycles
+Write translator target/host: 213.82/219.35 cycles
+Read translator target/host:  213.90/219.36 cycles
+```
+
+The four-NOP clock reduced physical-attempt cost, but writes rose to 2.98 WAITs
+per logical transfer and reads to 3.55. Translator ownership changes therefore
+grew to 42.26% of write SWD cycles and 43.60% of read SWD cycles. Four NOPs fix
+the zero-padding electrical/protocol failure; they do not solve request cadence
+or ownership overhead.
+
 The earlier aggregate-profiler code was also checked in two isolated build
 directories before the ACK/request/streak counters were added:
 
@@ -593,18 +647,28 @@ directories before the ACK/request/streak counters were added:
 - target/host ownership helpers grew from `0x6e`/`0x81` to `0x8f`/`0xa3`
   bytes respectively.
 
-Do not optimize the ownership helpers until the idle-cycle experiment has
-established whether expensive WAIT attempts can be replaced by idle clocks
-without U5 ownership changes. After that, three evidence-backed experiments
-are available for separate A/B tests:
+The first ownership-helper A/B is now implemented behind
+`CONFIG_ESP_SWD_DEDICATED_TRANSLATOR_CONTROLS`. When enabled, the output bundle
+has five of the ESP32-S3's eight per-CPU output channels in the bit-bang mode,
+in this order: SWCLK, SWDIO output, translator `/OE`, translator `DIR1`, and
+translator `DIR2`. In the SPI experiment, SPI2 owns SWCLK, SWDIO output,
+SWDIO input, and translator `/OE`; the dedicated output bundle contains only
+translator `DIR1` and `DIR2`. During bundle creation, the direction pad drivers
+are disabled, the dedicated values are initialized, and only then are the pad
+drivers re-enabled.
 
-1. Put U5 `/OE` and `DIR1` in the existing dedicated output bundle. ESP32-S3
-   has eight dedicated output channels per CPU and the current bundle uses two.
-2. Keep GPIO8 input-enable fixed instead of toggling it during ownership. The
+The dedicated-control build succeeded. Disassembly shows dedicated output
+instructions for translator `/OE` and direction changes. The GPIO8 pad
+output-enable and input-enable operations remain ordinary GPIO register
+operations. Hardware throughput and electrical behavior are not yet verified.
+
+After measuring that A/B, the remaining separate experiments are:
+
+1. Keep GPIO8 input-enable fixed instead of toggling it during ownership. The
    ESP32-S3 HAL and TRM treat pad input-enable and output-enable as independent;
    only output-enable controls whether GPIO8 drives. GPIO18 is the actual SWDIO
    input. Verify this change electrically before retaining it.
-3. Stop rewriting `DIR2` on every ownership change. Normal SWD leaves it low,
+2. Stop rewriting `DIR2` on every ownership change. Normal SWD leaves it low,
    so initialize it once and retain that state.
 
 Do not combine these changes initially, or the cycle profile will not identify
@@ -617,50 +681,168 @@ Official dedicated-GPIO reference:
 ## RMT and SPI accelerator feasibility
 
 These options were reviewed against the ESP32-S3 ESP-IDF peripheral APIs and
-the Rev 6 translator wiring. Neither backend has been implemented. Treat the
-following as an architecture assessment, not measured performance.
+the Rev 6 translator wiring. The first direct dual-channel RMT experiment was
+compiled and failed on hardware. A first carrier-envelope replacement also
+compiled and failed on hardware, but its logic-analyser capture identified a
+separate carrier-phase error. A continuous-carrier clock-gating replacement
+also failed and the RMT changes were discarded. A direct SPI2 HAL/LL backend is
+now implemented and has been compiled and run, but its receive path has not yet
+completed an IDCODE read.
 
 ### RMT
 
-The ESP32-S3 RMT peripheral can transmit level-duration symbols and ESP-IDF can
-synchronize multiple TX channels. In principle, one TX channel could generate
-SWCLK while a second generates host SWDIO. This does not map cleanly onto a
-complete SWD transaction:
+The earlier assessment rejected the stock RMT driver because each SWD request
+has a CPU-controlled ACK barrier and the driver's queued transaction and ISR
+completion overhead would dominate short phases. Inspection of epdiy's direct
+RMT setup established the useful LL pattern: write RMT memory directly, start
+the channel through `rmt_ll_*`, and poll raw completion flags. No epdiy source
+was copied.
 
-- every request must stop for the host-to-target turnaround and three-bit ACK;
-- the ACK determines whether a read data phase, write data phase, WAIT retry,
-  FAULT handling, or idle clocks follow;
-- Rev 6 must isolate U5, change `DIR1`, and disable or enable the GPIO8 pad
-  output driver between those phases;
-- RMT RX records level-duration symbols. It does not directly sample SWDIO on
-  externally defined SWCLK edges;
-- RMT cannot dynamically tri-state GPIO8 or operate U5 `/OE` and `DIR1` as a
-  conditional per-symbol side effect.
+The first `CONFIG_ESP_SWD_USE_RMT` implementation used TX0 for SWCLK, TX1 for
+request/sequences, and TX2 for write data. It encoded every SWCLK bit as a RAM
+symbol with four 80 MHz ticks low and four ticks high, and used synchronized TX
+starts for host-owned SWCLK plus SWDIO.
 
-A two-channel RMT design would therefore consist of many short queued segments
-with CPU intervention at every turnaround and ACK. The stock driver queues TX
-transactions and reports completion through an ISR, so that setup and
-synchronization overhead is likely to dominate a roughly 46-bit SWD transfer.
-A direct-register implementation could reduce driver overhead but would still
-need the same CPU-controlled barriers and a separate input sampling solution.
+That implementation compiled on ESP-IDF 6.0.2 but failed before IDCODE on
+2026-07-14 at both tightened and relaxed translator guards. The captured files
+were:
 
-Conclusion: RMT is technically usable for a waveform experiment, but it is not
-a promising throughput backend for this split-direction SWD link.
+```text
+/home/jackson/Downloads/decoder--260714-112632.csv
+/home/jackson/Downloads/DSLogic U3Pro32-la-260714-112632.csv
+```
+
+The target-side SWCLK period was approximately 100 ns, but finite host phases
+contained the wrong number of clocks. The intended 51-clock reset split at the
+47-symbol software boundary appeared as bursts of 64 and 6 clocks. The intended
+16-bit `0xe79e` JTAG-to-SWD selection emitted 22 clocks. Its SWDIO run lengths
+were stretched, and the decoder consequently reported AP accesses and NOREPLY
+instead of JTAG-to-SWD plus IDCODE. The later request/ACK waveform was already
+downstream of this malformed selection sequence.
+
+Espressif's ESP32-S3 TRM explains why the direct RAM symbols were invalid. For
+a non-zero RMT pulse-code period it requires:
+
+```text
+5 * T_apb_clk + 6 * T_rmt_sclk < period * T_clk_div
+```
+
+With APB and RMT source clocks both at 80 MHz and channel divider 1, each level
+must therefore exceed 11 source ticks. The implementation used four ticks per
+level. The TRM also gives a stricter timing bound for the period immediately
+before a zero end marker. Translator guard changes cannot correct either RMT
+memory-reader violation.
+
+The first replacement retained 10 MHz and used the RMT carrier unit rather than
+50 ns RAM entries:
+
+- TX0 is the only RMT channel used;
+- one long high RAM envelope gates a 10 MHz carrier configured for four 80 MHz
+  ticks high and four ticks low;
+- host SWDIO remains in the dedicated output bundle and software updates it
+  after each observed SWCLK falling edge;
+- target SWDIO is sampled from the dedicated input bundle on each observed
+  SWCLK rising edge;
+- the input bundle contains GPIO18 SWDIO first and GPIO6 SWCLK second;
+- one-to-three standalone clocks use slower software high/low writes because
+  their RMT envelope would violate the zero-end-marker timing bound;
+- all RMT interrupts remain disabled and completion is polled from raw status.
+
+This carrier-envelope implementation compiled and ran on 2026-07-14. It still
+failed at the first IDCODE read. The captured files were:
+
+```text
+/home/jackson/Downloads/decoder--260714-115244.csv
+/home/jackson/Downloads/DSLogic U3Pro32-la-260714-115244.csv
+```
+
+Unlike the direct-RAM attempt, the decoder recognized line reset, JTAG-to-SWD,
+the second line reset, and the IDCODE request before reporting `NOREPLY`. The
+target-side clock was a stable 10 MHz within bursts, but envelope boundaries
+were not phase-aligned to the free-running carrier:
+
+- the intended 16-clock `0xe79e` selection contained 17 rising edges;
+- the following eight-zero sequence contained nine rising edges;
+- the IDCODE request had eight clocks, but rising-edge data was
+  `11010010` instead of expected `10100101`;
+- the same request sampled on falling edges was correct, proving host SWDIO was
+  one target-visible clock late;
+- the target left SWDIO high during the four ACK clocks, consistent with the
+  malformed request never receiving a reply.
+
+The first pulse of an envelope could begin part-way through a carrier high
+phase and the final pulse could be truncated. Starting the RMT envelope and
+then waiting for software-observed edges therefore could neither guarantee the
+requested number of target-visible clocks nor associate bit zero with the first
+rising edge. Turnaround guard changes cannot correct this framing error.
+
+The next implementation keeps the carrier running continuously and uses the
+SWCLK translator `/OE` as a hardware clock gate:
+
+- TX0's 10 MHz carrier is enabled in all RMT states with its idle level high;
+- GPIO4 `SWCLK_nOE` joins the dedicated output bundle;
+- every phase starts hidden, observes a complete carrier high phase, and
+  enables the clock translator immediately after the following falling edge;
+- software counts the requested internal rising/falling edges, then disables
+  the clock translator after the final falling edge;
+- the first host data bit is preloaded before the clock translator is enabled;
+- no finite RMT RAM envelope, RMT TX start, end marker, or manual short-clock
+  fallback remains in the hot path.
+
+The clock translator shares `/OE` between SWCLK and BOOT. This experiment
+consequently isolates the BOOT channel between every SWD phase while leaving
+HOST_SWBOOT low. There is no target reset during normal transfer phases, but
+the target-side BOOT behavior while isolated has not been electrically
+verified. Treat this as an explicit hardware experiment, not a proven-safe
+production design.
+
+The clock-gated replacement requires a fixed 240 MHz CPU. Both host-driven and
+target-sampled carrier phases mask interrupts because software must service
+every SWDIO edge within a 100 ns clock. It no longer fills or reuses TX1/TX2
+waveforms during WAIT periods. This is a functional 10 MHz waveform experiment,
+not yet evidence of a throughput improvement.
+
+The full protocol still requires CPU barriers because RMT cannot interpret ACK
+or select the next phase, dynamically tri-state GPIO8, or change translator
+ownership as a conditional per-symbol side effect. RMT RX records transitions
+and durations rather than sampling SWDIO on each externally defined SWCLK edge.
+
+The discarded backend reset and exclusively owned the entire RMT peripheral.
+It could not coexist with another RMT user and deliberately bypassed the public
+RMT driver, encoders, queues, callbacks, and ISR path.
+
+The discarded RMT working tree had to declare its LL header dependencies
+unconditionally in `CMakeLists.txt`. ESP-IDF expands component requirements
+before project Kconfig values are reliably available; making `esp_hal_rmt`
+conditional caused the RMT source to compile without the target-specific
+`hal/rmt_ll.h` include directory.
+
+That working tree left `IRAM_ATTR` off function prototypes and put it only on
+definitions. ESP-IDF 6 implements `IRAM_ATTR` with a
+`__COUNTER__`-suffixed section name, so placing it on both a prototype and its
+definition generates conflicting section attributes with GCC 15. The new SPI
+file follows the same declaration pattern and includes `DAP_config.h` before
+`DAP.h`; `DAP_SWD` controls whether `DAP_Data_t.swd_conf` is present.
+
+The 10 MHz carrier frequency and 50 ns target-side half-periods are confirmed
+for the failed envelope implementation. No RMT backend remains in the current
+component working tree. Retain these captures as evidence of why that approach
+was abandoned rather than as instructions for another immediate RMT test.
 
 Official ESP-IDF references:
 
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html#start-transmission-simultaneously
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html#initiate-tx-transaction
+- https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf#rmt
 
 ### SPI
 
-SPI is a closer electrical match because the Rev 6 host-side signals are
-already separate: GPIO6 can be SCLK, GPIO8 MOSI, GPIO18 MISO, and active-low
-GPIO15 `/OE` can be SPI CS. GPIO17 `DIR1` still has to be controlled in
-software. A candidate backend would use SPI mode 0, LSB-first bit order, no
-DMA, polling transactions, an acquired bus, and automatic dummy insertion
-disabled.
+The current `CONFIG_ESP_SWD_USE_SPI` backend exclusively owns SPI2 and bypasses
+`spi_master`. It uses ESP32-S3 HAL/LL operations in mode 0, LSB-first, polling
+mode, with no DMA or dummy clocks. GPIO6 is SCLK, GPIO8 is MOSI, GPIO18 is MISO,
+and SPI2 CS0 drives the SWDIO translator's active-low `/OE` on GPIO15. GPIO17
+`DIR1` and GPIO16 `DIR2` remain in a two-line dedicated-GPIO bundle.
 
 It cannot be one ordinary half-duplex SPI transaction. SWD requires at least
 these CPU-separated phases:
@@ -671,38 +853,96 @@ RX ACK and optional read data -> CS high/SWCLK low -> isolate and turn hostward
 optional TX write data -> host idle
 ```
 
-The target ACK determines the next phase. Reads can potentially clock a fixed
-ACK-plus-data receive phase if WAIT/FAULT dummy-data behavior is deliberately
-matched. Writes still require a later transmit phase after ACK. The SPI
-driver's `cs_ena_pretrans` field is expressed in SPI clock cycles and could
-provide the settling guard after `/OE` is asserted, but the guard after `/OE`
-is deasserted and before changing `DIR1` still needs a CPU cycle-counter wait.
+The target ACK determines the next phase. The implementation therefore uses
+separate request, turnaround/ACK, read-data, turnaround, and write-data SPI
+transactions. Hardware CS isolates the translator between phases. A CPU-cycle
+guard runs after CS has gone inactive and before `DIR1` changes. CS setup timing
+then delays the first SWCLK edge after `/OE` becomes active; the configured
+guard is rounded up to whole 10 MHz SPI clocks, so 250 ns becomes 300 ns.
 
-There are additional details to prove before implementation:
+ESP32-S3 CPU-buffer receive accepts arbitrary lengths. CPU-buffer transmit does
+not accept lengths congruent to one modulo eight. The backend handles this
+without extra SWCLK edges:
 
-- ESP32-S3 has documented restrictions for TX lengths congruent to one modulo
-  eight, so the 33 data-plus-parity bits need a verified framing strategy;
+- a 33-bit SWD write is split into exact 2-bit and 31-bit transactions;
+- an isolated one-bit output sequence uses the SPI command phase;
 - automatic dummy bits must remain off because every extra SCLK edge is an SWD
   clock and changes protocol state;
 - disabling dummy compensation means the real translator, trace, and MISO
-  input delay still limits the usable SPI clock;
-- stock `spi_device_polling_transmit()` overhead is documented at roughly 9 us
-  for a one-byte polling transaction under Espressif's example conditions.
-  Two or three driver transactions per SWD word are therefore unlikely to beat
-  the current approximately 20 us/word observed at 200 KB/s.
+  input delay still limits the usable SPI clock.
 
-Conclusion: do not expect the stock SPI master driver to improve throughput. A
-specialized SPI2 backend that preconfigures registers and directly starts and
-polls each short phase remains a plausible later experiment, after dedicated
-GPIO profiling identifies the actual cycle budget. It must retain explicit U5
-ownership transitions and be tested for protocol framing and electrical
-settling rather than inferred from SPI clock rate.
+The first SPI build ran on hardware on 2026-07-14 but failed IDCODE host-side
+validation. The target recognized the request and returned an OK ACK. The
+capture files were:
+
+```text
+/home/jackson/Downloads/decoder--260714-123542.csv
+/home/jackson/Downloads/DSLogic U3Pro32-la-260714-123542.csv
+```
+
+The raw 100 MHz capture showed exact bursts of 51, 16, 51, and 8 clocks for
+entry, then 8 request clocks and 4 turnaround-plus-ACK clocks. The intended
+33-clock read-data phase emitted no clocks; only the later one-clock read
+turnaround appeared. The decoder consequently consumed clocks from later retry
+bursts to manufacture misleading IDCODE values. The missing burst established
+that software did not enter the successful-read branch, but by itself did not
+identify why.
+
+An initial hypothesis was that the direct LL path could clear `trans_done`,
+observe a stale asserted completion bit, and overwrite the shared data-length
+register before a new transaction was latched. The transaction helper was
+therefore changed to wait for command idle, wait for `trans_done` to clear,
+start the transaction, wait for completion, and then wait for command idle
+again. This is a defensive transaction boundary, not a confirmed root cause.
+
+That completion-barrier version compiled and ran, but IDCODE still failed. All
+four attempts reported:
+
+```text
+SPI RX debug: ACK raw=0x00000009 decoded=0x4,
+read requested/programmed=0/0 bits, FIFO=00000000:00000000,
+post-done busy=0
+```
+
+The zero post-done count and unchanged failure do not support the completion-
+race hypothesis. The skipped data branch is instead explained by the decoded
+FAULT value below.
+
+No new capture accompanied this run, but the earlier 100 MHz raw capture
+resolves `0x9`. During the four turnaround-plus-ACK clocks, target-side SWDIO
+was `1,1,0,0` at rising edges and `1,0,0,1` at falling edges. The latter is
+exactly the SPI FIFO value `0x9` in LSB-first order. The target therefore sent
+OK; SPI2 sampled the response half a cycle later and software incorrectly
+shifted the raw value as though it contained rising-edge samples.
+
+This behavior matches ESP-IDF's definition of
+`SPI_SAMPLING_POINT_PHASE_0`: master RX is delayed by half an SPI cycle from
+standard sampling. In the ESP32-S3 LL source,
+`spi_ll_master_set_rx_timing_mode()` is a no-op and
+`spi_ll_master_is_rx_std_sample_supported()` returns false. This is a
+chip-specific receive constraint, not an unverified translator timing theory.
+
+The current uncompiled working tree keeps the exact turnaround-plus-three-ACK
+clock window and realigns its delayed samples. For turnaround count `N`, ACK is
+decoded starting at FIFO bit `N-1`, and the following FIFO bit is retained as
+read data bit zero. A successful read then emits the full 33 data-plus-parity
+clocks; its delayed FIFO stream supplies data bits 1 through 31 and parity.
+The extra captured post-parity bit is ignored, so no SWD clock is removed or
+added.
+
+For the captured DP IDCODE `0x6ba02477`, the next failure diagnostic should
+show `TA+ACK raw=0x00000009 decoded=0x1`, receive length `33/33`, and read FIFO
+word zero `0xb5d0123b`. FIFO word one bit zero is deliberately ignored. A
+different result should be compared with a new raw capture before changing
+sampling logic again.
 
 Official ESP-IDF references:
 
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#spi-transactions
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#transactions-with-integers-other-than-uint8-t
 - https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/spi_master.html#transfer-speed-considerations
+- https://github.com/espressif/esp-idf/blob/v6.0.2/components/esp_hal_gpspi/include/hal/spi_types.h
+- https://github.com/espressif/esp-idf/blob/v6.0.2/components/esp_hal_gpspi/esp32s3/include/hal/spi_ll.h
 
 ## Build evidence and commands
 
@@ -720,8 +960,21 @@ v6.0.2.
 
 The enhanced ACK/request/streak profiler and zero-idle configuration also built
 successfully on 2026-07-13 with ESP-IDF v6.0.2 from
-`/home/jackson/esp/esp-idf`. This is compile evidence only; the enhanced
-profiler still needs a hardware run.
+`/home/jackson/esp/esp-idf`. Its subsequent hardware runs at idle 0, 2, 4, and
+8 and the four-NOP fast-path run are recorded above. The dedicated translator-
+control variant compiled with the generated configuration recorded above, but
+it has not been run on hardware.
+
+The first dual-channel direct-RMT backend compiled on ESP-IDF 6.0.2 and ran on
+hardware, but its four-tick RAM pulse entries violated the ESP32-S3 RMT timing
+bound and produced malformed clock counts before IDCODE. The carrier-envelope
+replacement also compiled and ran, but carrier phase at each envelope boundary
+produced extra/truncated clocks and one-clock-late host data. A later
+continuous-carrier, GPIO4-gated replacement still failed and was discarded.
+The first direct SPI2 backend compiled and produced the framing evidence above;
+the completion-barrier fix also compiled and ran but exposed the fixed
+half-cycle-delayed ESP32-S3 RX sample. The current receive realignment has not
+been compiled.
 
 Typical setup on the original machine:
 
@@ -734,7 +987,7 @@ Use the ESP-IDF path installed on the new machine. Prefer a fresh build
 directory when comparing configurations, and verify the generated config:
 
 ```sh
-rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|DEFAULT_CLOCK_HZ|TURNAROUND_DELAY_(US|NS)|IDLE_CYCLES|PERF_INSTRUMENTATION)|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
+rg 'ESP_SWD_(PHY_AXC2T245|USE_DEDICATED_GPIO|DEDICATED_TRANSLATOR_CONTROLS|USE_SPI|DEFAULT_CLOCK_HZ|FAST_DELAY_NOPS|TURNAROUND_DELAY_(US|NS)|IDLE_CYCLES|PERF_INSTRUMENTATION)|ESP_MAIN_TASK_AFFINITY' build/config/sdkconfig.h sdkconfig
 ```
 
 Useful object-code check for the dedicated backend:
@@ -749,38 +1002,51 @@ The exact build paths can differ by ESP-IDF/CMake version.
 
 ## Next hardware-debugging steps
 
-Keep the configured 32 MHz SWD clock, 250 ns translator guard, dedicated GPIO,
-240 MHz CPU, RAM range, block size, and iteration count fixed. Enhanced-profiler
-runs for idle 0, 2, 4, and 8 are complete. Do not continue upward: test idle 1
-and 3 to bracket the measured idle-2 optimum. Do not convert the requested
-32 MHz directly into a presumed 31.25 ns software-bit-banged idle clock; the
-observed successful-transfer costs show approximately 29.3 CPU cycles per
-added idle clock in this build.
+The immediate test is the uncompiled SPI receive-realignment fix with the same
+10 MHz clock, hardware-CS SWDIO translator enable, dedicated-GPIO direction
+controls, profiling, 250 ns guard, one idle cycle, and fixed 240 MHz CPU. Record
+the startup line and inspect the generated configuration rather than assuming
+the defaults were applied.
 
-The generated `sdkconfig`, rather than `sdkconfig.defaults`, controls the
-actual run. Record the complete startup configuration, target initial halt
-state, throughput, ACK cost, request-class lines, and WAIT streak histogram for
-each value. The useful setting is the one that reduces WAIT attempts enough to
-offset its extra idle clocks; do not select a value from WAIT count alone.
+First make the shortest useful hardware run: initialization through DP IDCODE.
+The failure-only log should decode the already observed raw `0x9` as ACK OK,
+then report `read requested/programmed=33/33`. The key waveform change is a
+33-clock burst immediately after the four-clock turnaround/ACK burst. On the
+target side, confirm:
 
-After the idle-1 and idle-3 diagnostic runs:
+1. A 10 MHz clock with approximately 50 ns low and 50 ns high times while a
+   transaction is active.
+2. Exactly 51 line-reset clocks with no partial first or final pulse.
+3. Exactly 16 JTAG-to-SWD selection clocks and the expected `0xe79e` LSB-first
+   data.
+4. Eight request clocks followed by one target-owned turnaround clock and
+   three ACK clocks.
+5. SWCLK returns low between SPI phases with no extra rising edge.
+6. SPI2 CS0 on GPIO15 is high between phases, goes low before the first SWCLK
+   edge, and provides at least the rounded 300 ns setup at a 250 ns setting.
+7. `DIR1` changes only while GPIO15 is high; GPIO8 is high impedance for every
+   target-owned phase.
+8. Host SWDIO is stable before each rising edge, including both sides of the
+   2-bit plus 31-bit write split.
+9. GPIO18 and target SWDIO agree during all three ACK samples and all read bits.
+10. GPIO4 `SWCLK_nOE` remains low and BOOT remains at the intended target-side
+    level throughout the session.
 
-1. Disable `CONFIG_ESP_SWD_PERF_INSTRUMENTATION` and compare idle 0, 1, 2, and
-   3, because profiler bookkeeping itself changes request cadence.
-2. Run the 100-iteration stability test on the fastest uninstrumented setting.
-3. Compare translated regular GPIO by changing only the dedicated-GPIO option.
-4. If idle clocks do not help, test a delay after WAIT separately instead of
-   changing the electrical turnaround guard.
-5. Only then A/B the U5 helper changes listed above, one at a time.
-
-For a fair regular-vs-dedicated comparison, change only:
+If IDCODE works, run the full 100-iteration test and retain the complete
+profiler output. The direct comparison should keep the guard, idle cycles,
+profiling, CPU frequency, RAM block, and iteration count fixed. Compare the
+10 MHz SPI2 backend with the 10 MHz dedicated bit-bang backend by changing only
+the backend selection while retaining a valid clock setting:
 
 ```text
-CONFIG_ESP_SWD_USE_DEDICATED_GPIO
+CONFIG_ESP_SWD_USE_SPI
 ```
 
-Keep the main task explicitly pinned in both builds to reduce scheduler-related
-differences.
+Compare transfer cycles, ACK OK/WAIT costs, WAIT counts and streaks, and final
+KB/s. SPI can alter target request cadence, so a lower physical phase cost does
+not guarantee fewer WAITs or higher throughput. Only after selecting the best
+instrumented variant should profiling be disabled for final throughput and
+stability runs.
 
 If `Set transit fail` / `JTAG2SWD fail` remains unchanged, do not keep adding
 arbitrary delay. Capture the actual ACK returned by the first IDCODE DP read.
@@ -801,14 +1067,15 @@ Avoid timing-heavy `ESP_LOG` calls inside the SWD bit loop. For diagnosis,
 store the raw ACK in a temporary variable/global and log it after the transfer,
 or temporarily expose it through the higher-level read function.
 
-Scope or logic-analyzer checks should be made on the target side of U5/U7, not
-only at ESP32 pins:
+Scope or logic-analyzer checks should be made on the target side of both
+translators, not only at ESP32 pins:
 
 1. Confirm VPP is present and between 0.65 V and 3.6 V; normally use 3.3 V.
-2. Confirm U7 `/OE` goes low and target SWCLK toggles.
+2. Confirm the SWCLK/BOOT translator `/OE` goes low and target SWCLK toggles.
 3. Confirm BOOT remains low.
 4. Confirm request bits appear at target SWDIO.
-5. Confirm U5 `/OE` goes high during each ownership change.
+5. In SPI mode, confirm the SWDIO translator `/OE` is high between every SPI
+   phase and low only for the active phase.
 6. Confirm DIR1 is high for host request/data and low for target ACK/read data.
 7. Confirm target ACK bits appear after the turnaround clock.
 8. Confirm GPIO18/A2 sees the same target-side level.
@@ -816,7 +1083,7 @@ only at ESP32 pins:
 10. Confirm GPIO7 high pulls target reset low and GPIO7 low releases it.
 
 If regular translated GPIO works but dedicated GPIO still fails with identical
-electrical U5 control, focus next on:
+electrical translator control, focus next on:
 
 - dedicated input bundle allocation and `g_swd_dedic_data_in_mask`;
 - whether GPIO18 is routed to the dedicated input channel expected on the
@@ -849,21 +1116,24 @@ These were identified but were not treated as blockers for the minimal demo:
 7. The component README may contain historical wording saying the top-level
    Soul Injector project lacks Rev 6 defaults. The top-level project was updated
    afterward; verify and refresh that paragraph if maintaining the docs.
-8. A working unpaced YOLO build was reported not to improve throughput
-   materially, but its complete configuration and profile were not retained.
+8. Zero-NOP fast mode is confirmed broken. Four-NOP fast mode is stable but
+   produced 210.03 KB/s writes and 190.10 KB/s reads under instrumentation;
+   its higher WAIT rate erased the lower physical-transfer cost.
 
 ## Working rules for the next Codex instance
 
 - Do not invent a target MCU memory map, voltage, ACK value, or measured speed.
 - Do not claim hardware success from a successful build.
+- In software, logs, and documentation, call the SN74AXC2T245 devices
+  "translators" or "level shifters"; do not use schematic reference designators.
 - Preserve the direct-GPIO legacy backend while changing the translated Rev 6
   backend.
 - Keep regular GPIO available for A/B diagnosis.
 - Keep all dedicated-GPIO SWD calls on one explicitly pinned task/core.
-- Keep U5 isolated while changing DIR1 or output ownership.
+- Keep the SWDIO translator isolated while changing DIR1 or output ownership.
 - Keep SWCLK low during translator settling guards.
 - Keep paced SWD clocks derived from `CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ`. Treat
-  `-1` as the explicit unpaced transfer sentinel, and keep the separate
+  `-1` as the fixed-NOP fast transfer sentinel, and keep the separate
   translator-settling delay limited to ownership transitions.
 - Use `rg` for source searches and inspect the generated `sdkconfig` before
   diagnosing the selected backend.
