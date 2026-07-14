@@ -140,11 +140,18 @@ update an existing configuration.
 Three direct-RMT waveform experiments were subsequently attempted. None
 reached a working IDCODE transaction, and the user restored the component to
 the last working dedicated-GPIO state. The RMT source was removed. The current
-experiment is a direct SPI2 HAL/LL backend at 10 MHz, described below. Two
-hardware runs reached a target-generated OK response but failed to decode it in
-SPI2 RX. The latest receive realignment is uncompiled and unmeasured. Do not
-describe the SPI backend as working until it reads IDCODE and completes the RAM
-test.
+experiment is a direct SPI2 HAL/LL backend initially proven at 10 MHz and now
+being swept upward, described below. Two hardware runs reached a target-
+generated OK response but failed to decode it in SPI2 RX. The receive
+realignment then completed the full 100-iteration RAM
+stress test and restored RAM successfully. A fixed-response phase-coalescing
+optimization then read IDCODE but failed on the first DHCSR memory access. The
+staged-read isolation subsequently works at 10 MHz and requested 12 MHz while
+retaining write-side coalescing. Frequency-specific RX alignment then made 16
+and 20 MHz work as well. The current uncompiled optimization removes one SPI
+transaction barrier from every read attempt and specializes fixed hot-path
+operations; retain the successful 20 MHz profile below as the comparison
+baseline.
 
 ## Confirmed Rev 6 GPIO map
 
@@ -178,11 +185,11 @@ CONFIG_ESP_SWD_DATA_DIR2_PIN=16
 CONFIG_ESP_SWD_CLK_NOE_PIN=4
 CONFIG_ESP_SWD_NRST_PIN=7
 CONFIG_ESP_SWD_BOOT_PIN=5
-CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=10000000
-CONFIG_ESP_SWD_FAST_DELAY_NOPS=4
+CONFIG_ESP_SWD_DEFAULT_CLOCK_HZ=20000000
+CONFIG_ESP_SWD_FAST_DELAY_NOPS=0
 CONFIG_ESP_SWD_TURNAROUND_DELAY_US=0
-CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=250
-CONFIG_ESP_SWD_IDLE_CYCLES=1
+CONFIG_ESP_SWD_TURNAROUND_DELAY_NS=0
+CONFIG_ESP_SWD_IDLE_CYCLES=0
 CONFIG_ESP_SWD_USE_DEDICATED_GPIO=y
 CONFIG_ESP_SWD_DEDICATED_TRANSLATOR_CONTROLS=y
 CONFIG_ESP_SWD_USE_SPI=y
@@ -686,8 +693,9 @@ compiled and failed on hardware. A first carrier-envelope replacement also
 compiled and failed on hardware, but its logic-analyser capture identified a
 separate carrier-phase error. A continuous-carrier clock-gating replacement
 also failed and the RMT changes were discarded. A direct SPI2 HAL/LL backend is
-now implemented and has been compiled and run, but its receive path has not yet
-completed an IDCODE read.
+now implemented and has completed a 100-iteration hardware stress test. Its
+first working implementation is slower than dedicated GPIO, so the current
+working tree reduces the number of SPI hardware transactions per SWD attempt.
 
 ### RMT
 
@@ -853,18 +861,28 @@ RX ACK and optional read data -> CS high/SWCLK low -> isolate and turn hostward
 optional TX write data -> host idle
 ```
 
-The target ACK determines the next phase. The implementation therefore uses
-separate request, turnaround/ACK, read-data, turnaround, and write-data SPI
-transactions. Hardware CS isolates the translator between phases. A CPU-cycle
-guard runs after CS has gone inactive and before `DIR1` changes. CS setup timing
-then delays the first SWCLK edge after `/OE` becomes active; the configured
-guard is rounded up to whole 10 MHz SPI clocks, so 250 ns becomes 300 ns.
+The target ACK determines whether the host retries or continues. Reads retain
+separate request, turnaround/ACK, read-data, and turnaround transactions so a
+WAIT can stop before the optional data phase. Successful writes coalesce the
+ACK-to-host turnaround into the response transaction and send all 33 data bits
+in one following transaction. Hardware CS isolates the translator between host
+and target phases. A CPU-cycle guard runs after CS has gone inactive and before
+`DIR1` changes. CS setup timing then delays the first SWCLK edge after `/OE`
+becomes active; the configured guard is rounded up to whole cycles at the
+actual SPI frequency.
+
+The direct backend accepts requested frequencies of 10, 12, 16, and 20 MHz.
+ESP32-S3 SPI2 uses its 80 MHz APB source, so the LL divider produces actual
+frequencies of 10, approximately 11.429, 16, and 20 MHz. Initialization logs
+both requested and actual values. Defaults and the current generated
+configuration select 20 MHz for the hot-path performance test.
 
 ESP32-S3 CPU-buffer receive accepts arbitrary lengths. CPU-buffer transmit does
 not accept lengths congruent to one modulo eight. The backend handles this
 without extra SWCLK edges:
 
-- a 33-bit SWD write is split into exact 2-bit and 31-bit transactions;
+- a 33-bit SWD write uses a one-bit command and 32-bit MOSI data phase in one
+  transaction;
 - an isolated one-bit output sequence uses the SPI command phase;
 - automatic dummy bits must remain off because every extra SCLK edge is an SWD
   clock and changes protocol state;
@@ -922,19 +940,132 @@ standard sampling. In the ESP32-S3 LL source,
 `spi_ll_master_is_rx_std_sample_supported()` returns false. This is a
 chip-specific receive constraint, not an unverified translator timing theory.
 
-The current uncompiled working tree keeps the exact turnaround-plus-three-ACK
-clock window and realigns its delayed samples. For turnaround count `N`, ACK is
+The next working-tree version kept the exact turnaround-plus-three-ACK
+clock window and realigned its delayed samples. For turnaround count `N`, ACK is
 decoded starting at FIFO bit `N-1`, and the following FIFO bit is retained as
 read data bit zero. A successful read then emits the full 33 data-plus-parity
 clocks; its delayed FIFO stream supplies data bits 1 through 31 and parity.
 The extra captured post-parity bit is ignored, so no SWD clock is removed or
 added.
 
-For the captured DP IDCODE `0x6ba02477`, the next failure diagnostic should
-show `TA+ACK raw=0x00000009 decoded=0x1`, receive length `33/33`, and read FIFO
-word zero `0xb5d0123b`. FIFO word one bit zero is deliberately ignored. A
-different result should be compared with a new raw capture before changing
-sampling logic again.
+The user built that receive realignment and ran the full stress test on
+2026-07-14. The decoder dump is:
+
+```text
+/home/jackson/Downloads/decoder--260714-132950.csv
+```
+
+Generated runtime configuration was 10 MHz SPI2, zero translator guard, zero
+CS setup clocks, zero idle cycles, dedicated translator controls, and 240 MHz
+CPU profiling. DP IDCODE was `0x6ba02477`; all 100 iterations verified and the
+original RAM was restored. There were no transfer, mismatch, recovery, FAULT,
+parity, or invalid-ACK failures.
+
+Measured working SPI baseline:
+
+```text
+Write: 178.14 KB/s, 208000 attempts, 206400 OK, 1600 WAIT
+Read:  135.69 KB/s, 412800 attempts, 206400 OK, 206400 WAIT
+Write ACK cost: OK 5163.51 cycles, WAIT 2614.84 cycles
+Read ACK cost:  OK 4166.60 cycles, WAIT 2616.49 cycles
+Write/read successful transfer cost: 21.51/17.36 us
+```
+
+Compared with the earlier enhanced-profiler dedicated-GPIO idle-zero result,
+SPI was 17.27% slower for writes and 24.56% slower for reads. It nearly removed
+AP write WAITs and reduced AP read behavior to almost exactly one WAIT before
+each OK, but each hardware attempt was much more expensive. A successful SWD
+transfer carries approximately 46 clocks, only 4.6 us at 10 MHz, leaving about
+16.9 us of non-wire cost for an SPI write OK and 12.8 us for a read OK.
+
+The decoder confirms the per-attempt barriers: request-to-ACK was consistently
+about 3.75 us, read WAIT retries recurred at 11.22 us, successful reads took at
+least 17.94 us request-to-next-request, and successful writes at least 20.42 us.
+The working path used four SPI transactions for a read OK and five for a write
+OK, so direct LL `UPDATE`, start, completion polling, and CS boundaries, rather
+than target WAITs, became the primary bottleneck.
+
+The first optimization made every read attempt an 8-clock request followed by
+one fixed 38-clock target response: turnaround, ACK, 33 data or dummy clocks,
+and trailing turnaround. The user built it on 2026-07-14. SWD initialization
+and a subsequent DP IDCODE read succeeded with IDCODE `0x6ba02477`, but the
+first `swd_read_word(0xe000edf0)` failed and the demo reported `Failed to read
+target halt state`.
+
+Source inspection identifies a concrete protocol mismatch in that experiment.
+`DAP_Setup()` initializes `DAP_Data.swd_conf.data_phase` to zero, but the fixed
+read response unconditionally emitted the 33 dummy data clocks after WAIT.
+This differs from both the selected CMSIS-DAP behavior and the earlier working
+SPI path. The first DHCSR access introduces AP traffic, where the working
+profile showed frequent WAIT responses; the DP-only initialization does not
+exercise the same path.
+
+The staged-read isolation restores the working read behavior:
+
+- A read response stops after turnaround plus ACK. OK then receives 33 data and
+  parity clocks followed by turnaround. WAIT receives only turnaround unless
+  `data_phase` explicitly requests the dummy clocks.
+- Every write OK still uses three transactions: request, a 5-clock
+  turnaround/ACK/turnaround response, and one continuous 33-clock write.
+- The 33-bit write still uses a one-bit SPI command plus a 32-bit MOSI data
+  phase instead of separate 2-bit and 31-bit transactions.
+- Data-idle changes remain deferred to the next required config update while
+  hardware CS keeps the translator isolated.
+
+The user subsequently reported that 10 MHz and requested 12 MHz (approximately
+11.429 MHz actual) work, but 16 and 20 MHz fail during IDCODE RX. No complete
+12 MHz throughput profile is recorded here. At 20 MHz with a 250 ns guard, the
+target recognized the IDCODE request and SPI returned:
+
+```text
+response[31:0]=0x00000003, ACK=0x3, RX requested/programmed=4/4
+```
+
+Raw `0x3` is turnaround `1` followed by target ACK `001`, so ACK starts at FIFO
+bit one. This is standard SWD alignment. The slower working path saw raw `0x9`
+and needed ACK at bit zero because the falling-edge sample had already observed
+the target's next value. The effective alignment therefore changes between the
+11.429 and 16 MHz settings on this board.
+
+ESP-IDF v6.0.2's ESP32-S3 `spi_ll_set_miso_delay()` is a no-op, so there is no
+supported LL input-delay setting to normalize the samples. The implemented fix
+uses delayed-edge ACK/data unpacking at 10/11.429 MHz and standard
+turnaround/ACK/data unpacking at 16/20 MHz. This changes both ACK shift and the
+33-bit data/parity reconstruction and logs the selected mode. The user
+confirmed successful stress runs at all four settings.
+
+The first successful 20 MHz profile used zero translator guard and zero idle
+cycles. All 100 iterations verified and RAM was restored:
+
+```text
+Write: 204.35 KB/s, OK/WAIT=206400/138317, OK/WAIT cost=3199.19/1850.83 cycles
+Read:  153.38 KB/s, OK/WAIT=206400/206400, OK/WAIT cost=3535.12/2438.51 cycles
+Write/read SWD share: 95.24%/96.18%
+```
+
+At 20 MHz, an OK transfer's approximately 46 wire clocks consume only about
+552 CPU cycles, far below its measured 3199 write or 3535 read cycles. Ordinary
+loop unrolling or aligned buffer access cannot address most of this gap. The
+current uncompiled hot-path experiment instead:
+
+- extends the read ACK transaction by one turnaround width; on OK these are
+  initial data bits, while on WAIT they are the complete trailing turnaround;
+- receives the remaining data/parity and read trailing turnaround in one
+  33-clock transaction, removing one hardware transaction from every read OK
+  and WAIT without changing total SWD clocks;
+- uses a 16-byte DRAM request-packet lookup instead of recalculating request
+  parity on every physical attempt;
+- directly invokes fixed 8-bit request and 33-bit write helpers instead of the
+  generic bit-count dispatcher;
+- removes the redundant command-idle poll before a transaction while retaining
+  the post-completion command-idle guarantee;
+- captures the detailed SPI RX diagnostic only around the JTAG-to-SWD IDCODE
+  probe instead of clearing and updating seven debug words on every physical
+  stress-test attempt.
+
+The public memory APIs still accept byte pointers. Do not force word-aligned
+loads without either changing that contract or adding an alignment-safe
+fallback; non-SWD work was only 4-5% of the measured calls.
 
 Official ESP-IDF references:
 
@@ -973,8 +1104,13 @@ produced extra/truncated clocks and one-clock-late host data. A later
 continuous-carrier, GPIO4-gated replacement still failed and was discarded.
 The first direct SPI2 backend compiled and produced the framing evidence above;
 the completion-barrier fix also compiled and ran but exposed the fixed
-half-cycle-delayed ESP32-S3 RX sample. The current receive realignment has not
-been compiled.
+half-cycle-delayed ESP32-S3 RX sample. The receive realignment then compiled and
+completed the full hardware stress test with the profile recorded above. The
+fixed-read phase-coalescing optimization then compiled and reached IDCODE but
+failed on the first DHCSR access. The staged-read isolation and configurable
+SPI clock change subsequently worked at 10 and requested 12 MHz. The 16/20 MHz
+standard-alignment RX fix also completed the stress test. The transaction-
+barrier and fixed-phase hot-path optimization has not been compiled.
 
 Typical setup on the original machine:
 
@@ -1002,41 +1138,45 @@ The exact build paths can differ by ESP-IDF/CMake version.
 
 ## Next hardware-debugging steps
 
-The immediate test is the uncompiled SPI receive-realignment fix with the same
-10 MHz clock, hardware-CS SWDIO translator enable, dedicated-GPIO direction
-controls, profiling, 250 ns guard, one idle cycle, and fixed 240 MHz CPU. Record
-the startup line and inspect the generated configuration rather than assuming
-the defaults were applied.
+The immediate test is the uncompiled fixed-phase hot-path optimization at
+20 MHz with hardware-CS SWDIO translator enable, dedicated-GPIO direction
+controls, profiling, zero guard, zero idle cycles, and fixed 240 MHz CPU. Record the
+startup line and inspect the generated configuration rather than assuming the
+defaults were applied.
 
-First make the shortest useful hardware run: initialization through DP IDCODE.
-The failure-only log should decode the already observed raw `0x9` as ACK OK,
-then report `read requested/programmed=33/33`. The key waveform change is a
-33-clock burst immediately after the four-clock turnaround/ACK burst. On the
-target side, confirm:
+First run only through IDCODE and the target halt-state read, then inspect the
+waveform before starting the stress test. The useful pass criteria are
+`RX alignment=standard`, a valid IDCODE, and then a successful DHCSR read. For
+turnaround one, the target-side waveform should show:
 
-1. A 10 MHz clock with approximately 50 ns low and 50 ns high times while a
+1. A 20 MHz clock with approximately 25 ns low and 25 ns high times while a
    transaction is active.
 2. Exactly 51 line-reset clocks with no partial first or final pulse.
 3. Exactly 16 JTAG-to-SWD selection clocks and the expected `0xe79e` LSB-first
    data.
-4. Eight request clocks followed by one target-owned turnaround clock and
-   three ACK clocks.
-5. SWCLK returns low between SPI phases with no extra rising edge.
-6. SPI2 CS0 on GPIO15 is high between phases, goes low before the first SWCLK
-   edge, and provides at least the rounded 300 ns setup at a 250 ns setting.
-7. `DIR1` changes only while GPIO15 is high; GPIO8 is high impedance for every
+4. A read attempt has 8 request clocks followed by a 5-clock response burst:
+   turnaround, three ACK clocks, and one lookahead clock.
+5. On read OK, the lookahead is data bit zero and one 33-clock burst carries
+   the remaining data/parity plus trailing turnaround.
+6. On read WAIT with `data_phase=0`, the lookahead is the complete trailing
+   turnaround and the next burst is the following request; there must be no
+   dummy data transaction.
+7. SWCLK returns low between SPI phases with no extra rising edge.
+8. SPI2 CS0 on GPIO15 is high between phases and goes low before the first
+   SWCLK edge. This baseline intentionally uses zero configured CS setup clocks.
+9. `DIR1` changes only while GPIO15 is high; GPIO8 is high impedance for every
    target-owned phase.
-8. Host SWDIO is stable before each rising edge, including both sides of the
-   2-bit plus 31-bit write split.
-9. GPIO18 and target SWDIO agree during all three ACK samples and all read bits.
-10. GPIO4 `SWCLK_nOE` remains low and BOOT remains at the intended target-side
+10. A write data phase is 33 continuous clocks: one command-phase bit followed
+   immediately by 32 MOSI data-phase bits, with no extra or missing edge.
+11. GPIO18 and target SWDIO agree during all three ACK samples and all read bits.
+12. GPIO4 `SWCLK_nOE` remains low and BOOT remains at the intended target-side
     level throughout the session.
 
-If IDCODE works, run the full 100-iteration test and retain the complete
+If the DHCSR read works, run the full 100-iteration test and retain the complete
 profiler output. The direct comparison should keep the guard, idle cycles,
 profiling, CPU frequency, RAM block, and iteration count fixed. Compare the
-10 MHz SPI2 backend with the 10 MHz dedicated bit-bang backend by changing only
-the backend selection while retaining a valid clock setting:
+SPI2 backend with dedicated bit-bang at the same requested setting by changing
+only the backend selection while retaining a valid clock setting:
 
 ```text
 CONFIG_ESP_SWD_USE_SPI
