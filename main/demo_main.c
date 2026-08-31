@@ -202,7 +202,7 @@ static void log_swd_profile(const char *tag, const char *name,
     const uint64_t average_transfer_ns = stats->transfer_count == 0U
         ? 0U
         : stats->transfer_cycles * 1000U /
-              ((uint64_t)CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ *
+              ((uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ *
                stats->transfer_count);
 
     ESP_LOGI(tag,
@@ -353,7 +353,7 @@ void app_main(void)
     ESP_LOGW(TAG,
              "SWD cycle instrumentation enabled at %u MHz; profiler bookkeeping "
              "reduces measured throughput",
-             CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
+             CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
 #endif
 
     if ((block_size == 0) || (address > UINT32_MAX - block_size)) {
