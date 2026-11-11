@@ -399,6 +399,33 @@ esp_err_t ina226::set_sample_mode(avg_mode sample_per_avg)
     return write_u16(REG_CONFIG, config);
 }
 
+esp_err_t ina226::set_operate_mode(operate_mode mode)
+{
+    if (mode > OP_MODE_SHUNT_BUS_CONT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t config = 0;
+
+    esp_err_t ret = read_u16(REG_CONFIG, &config);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /*
+     * CONFIG:
+     *
+     * D2..D0 = MODE
+     */
+    constexpr uint16_t MASK = 0x07;
+
+    config &= ~MASK;
+    config |= static_cast<uint16_t>(mode) & MASK;
+
+    return write_u16(REG_CONFIG, config);
+}
+
 esp_err_t ina226::write(uint8_t reg, const uint8_t* buf, size_t len, int32_t wait_ms)
 {
     if (buf == nullptr) {

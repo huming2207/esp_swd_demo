@@ -71,6 +71,9 @@ constexpr double STEP_DOWN_MARGIN = 0.7;
 constexpr uint32_t STEP_DOWN_SAMPLES = 3;
 constexpr int64_t STEP_DOWN_HOLDOFF_US = 200000;
 constexpr uint32_t SNAPSHOT_SETTLE_MS = 60; // Allows several 8.8 ms conversions after a switch
+constexpr uint32_t BIAS_TEST_SETTLE_MS = 100;
+constexpr uint32_t BIAS_TEST_WINDOW_MS = 3000;
+constexpr double BIAS_TEST_CONTROL_LIMIT_A = 1.5e-6;
 
 double trip_min_amps(double vbus, range_id into)
 {
@@ -648,6 +651,88 @@ void run_auto_range()
              g_ranger.overflows());
 }
 
+bool average_current(range_id sensor, uint32_t duration_ms, double &amps_out)
+{
+    double sum = 0.0;
+    uint32_t count = 0;
+
+    delay_ms(BIAS_TEST_SETTLE_MS);
+    const int64_t end_us = esp_timer_get_time() + duration_ms * 1000LL;
+    while (esp_timer_get_time() < end_us) {
+        double amps = 0.0;
+        if (g_sensors[sensor].read_current(&amps) != ESP_OK) {
+            return false;
+        }
+        sum += amps;
+        count++;
+        delay_ms(10);
+    }
+
+    if (count == 0) {
+        return false;
+    }
+    amps_out = sum / count;
+    return true;
+}
+
+/*
+ * Tests whether the INA226 shunt pins explain the open-output current. In LOW
+ * range R22 carries U7 Vin- and both U8 pins, while R23 carries only U8 Vin-.
+ * Powering down U8 should therefore remove two pins' current from U7's reading,
+ * and powering down U7 should leave U8's reading unchanged.
+ */
+void run_bias_test()
+{
+    double u7_all_on = 0.0;
+    double u8_all_on = 0.0;
+    double u7_with_u8_off = 0.0;
+    double u8_with_u7_off = 0.0;
+    double u7_repeat = 0.0;
+
+    g_latch.force_all_bypass();
+    delay_ms(SNAPSHOT_SETTLE_MS);
+    g_latch.step_down();
+    delay_ms(SNAPSHOT_SETTLE_MS);
+    g_latch.step_down();
+    delay_ms(SNAPSHOT_SETTLE_MS);
+
+    latch_state latched = g_latch.read();
+    if (latched.high || latched.mid) {
+        ESP_LOGI(TAG, "Bias test skipped: LOW range did not hold. It needs pin 9 open.");
+        return;
+    }
+
+    bool ok = average_current(RANGE_MID, BIAS_TEST_WINDOW_MS, u7_all_on) &&
+              average_current(RANGE_LOW, BIAS_TEST_WINDOW_MS, u8_all_on);
+
+    ok = ok && g_sensors[RANGE_LOW].set_operate_mode(ina226::OP_MODE_POWER_DOWN) == ESP_OK &&
+         average_current(RANGE_MID, BIAS_TEST_WINDOW_MS, u7_with_u8_off);
+    ok = g_sensors[RANGE_LOW].set_operate_mode(ina226::OP_MODE_SHUNT_BUS_CONT) == ESP_OK && ok;
+
+    ok = ok && g_sensors[RANGE_MID].set_operate_mode(ina226::OP_MODE_POWER_DOWN) == ESP_OK &&
+         average_current(RANGE_LOW, BIAS_TEST_WINDOW_MS, u8_with_u7_off);
+    ok = g_sensors[RANGE_MID].set_operate_mode(ina226::OP_MODE_SHUNT_BUS_CONT) == ESP_OK && ok;
+
+    ok = ok && average_current(RANGE_MID, BIAS_TEST_WINDOW_MS, u7_repeat);
+
+    latched = g_latch.read();
+    if (!ok || latched.high || latched.mid) {
+        ESP_LOGE(TAG, "Bias test invalid: ok=%d, latch HIGH=%d MID=%d", ok, latched.high, latched.mid);
+        return;
+    }
+
+    const double predicted_drop = 2.0 * u8_all_on;
+    const double measured_drop = u7_all_on - u7_with_u8_off;
+    const bool consistent = fabs(measured_drop - predicted_drop) <= 0.3 * fabs(predicted_drop) &&
+                            fabs(u8_with_u7_off - u8_all_on) <= BIAS_TEST_CONTROL_LIMIT_A;
+
+    ESP_LOGI(TAG, "Bias test: U7 all on=%.2f uA, U7 with U8 off=%.2f uA, U7 repeat=%.2f uA, "
+                  "U8 all on=%.2f uA, U8 with U7 off=%.2f uA",
+             u7_all_on * 1e6, u7_with_u8_off * 1e6, u7_repeat * 1e6, u8_all_on * 1e6, u8_with_u7_off * 1e6);
+    ESP_LOGI(TAG, "Bias test: U7 drop predicted=%.2f uA, measured=%.2f uA, consistent with pin bias=%d",
+             predicted_drop * 1e6, measured_drop * 1e6, consistent);
+}
+
 void log_results(const char *label)
 {
     static constexpr const char *RESULT_NAMES[] = {"NOT EXERCISED", "PASS", "FAIL"};
@@ -842,6 +927,7 @@ extern "C" void power_profiler_run_test(const char *label)
         check_alert_line();
         run_ladder();
         run_auto_range();
+        run_bias_test();
     }
 
     g_latch.force_all_bypass();

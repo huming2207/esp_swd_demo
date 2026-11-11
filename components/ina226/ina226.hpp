@@ -163,6 +163,13 @@ public:
      */
     esp_err_t set_sample_mode(avg_mode sample_per_avg);
 
+    /**
+     * Set the operating mode, for example power-down or continuous conversion
+     * @param mode See datasheet
+     * @return ESP_OK if success
+     */
+    esp_err_t set_operate_mode(operate_mode mode);
+
 private:
     esp_err_t init_failed(esp_err_t error);
     esp_err_t write(uint8_t reg, const uint8_t *buf, size_t len, int32_t wait_ms = 1000);
