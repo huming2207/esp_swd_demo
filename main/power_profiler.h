@@ -1,12 +1,27 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <esp_err.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct {
+    bool ok;
+    double avg_amps;
+    double min_amps;
+    double max_amps;
+    double vin_volts;
+    uint32_t samples;
+    uint32_t low_samples;
+    uint32_t mid_samples;
+    uint32_t high_samples;
+    uint32_t steps;
+    uint32_t trips;
+} power_profiler_result_t;
 
 /**
  * Set up the debug-line switch, range latches, I2C bus and the three INA226s.
@@ -26,6 +41,15 @@ void power_profiler_force_bypass(void);
  * Does nothing if power_profiler_init() failed. Leaves both bypasses on.
  */
 void power_profiler_run_test(const char *label);
+
+/**
+ * Start auto-ranged current sampling on the other CPU core. Blocks through the
+ * warm-up, whose samples are discarded. Returns false if the sensors are not ready.
+ */
+bool power_profiler_sample_begin(uint32_t warmup_ms);
+
+/** Stop sampling and return the results since the warm-up ended. */
+void power_profiler_sample_end(power_profiler_result_t *result);
 
 #ifdef __cplusplus
 }

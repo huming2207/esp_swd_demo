@@ -177,6 +177,12 @@ public:
     uint32_t overflows() const { return overflow_count; }
     uint32_t trips(range_id into) const { return trip_count[into]; }
     uint32_t range_samples(range_id r) const { return per_range_samples[r]; }
+    double average_amps() const { return total_samples == 0 ? 0.0 : sum_amps / total_samples; }
+    double minimum_amps() const { return min_amps; }
+    double maximum_amps() const { return max_amps; }
+
+    /** Discard results so far without disturbing the range or state. */
+    void clear_stats();
 
     /** Log averages since the previous call and start a new window. */
     void log_window();
@@ -203,6 +209,9 @@ private:
     double window_max = 0.0;
     uint32_t window_count = 0;
 
+    double sum_amps = 0.0;
+    double min_amps = 0.0;
+    double max_amps = 0.0;
     uint32_t total_samples = 0;
     uint32_t step_count = 0;
     uint32_t rejected_count = 0;
@@ -281,6 +290,9 @@ void auto_ranger::measure()
     /* A complete conversion in the new range means a firmware step held. */
     step_pending = false;
 
+    min_amps = total_samples == 0 ? amps : fmin(min_amps, amps);
+    max_amps = total_samples == 0 ? amps : fmax(max_amps, amps);
+    sum_amps += amps;
     total_samples++;
     per_range_samples[active]++;
     window_sum += amps;
@@ -357,6 +369,24 @@ void auto_ranger::tick()
         break;
     case state::FAULT:
         break;
+    }
+}
+
+void auto_ranger::clear_stats()
+{
+    sum_amps = 0.0;
+    min_amps = 0.0;
+    max_amps = 0.0;
+    total_samples = 0;
+    step_count = 0;
+    rejected_count = 0;
+    glitch_count = 0;
+    overflow_count = 0;
+    window_sum = 0.0;
+    window_count = 0;
+    for (uint8_t r = 0; r < RANGE_COUNT; ++r) {
+        trip_count[r] = 0;
+        per_range_samples[r] = 0;
     }
 }
 
@@ -672,6 +702,39 @@ esp_err_t init_sensors()
     return result;
 }
 
+TaskHandle_t g_sampler = nullptr;
+TaskHandle_t g_requester = nullptr;
+esp_err_t g_init_result = ESP_FAIL;
+uint32_t g_warmup_ms = 0;
+
+/*
+ * Created once at init and pinned to the other core. The I2C interrupt is
+ * allocated here too, so current sampling does not interrupt the SWD task.
+ */
+void sampler_task(void *)
+{
+    g_init_result = init_sensors();
+    xTaskNotifyGive(g_requester);
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        g_ranger.restart();
+        const int64_t warmup_end_us = esp_timer_get_time() + g_warmup_ms * 1000LL;
+        while (esp_timer_get_time() < warmup_end_us) {
+            g_ranger.tick();
+            vTaskDelay(1);
+        }
+        g_ranger.clear_stats();
+        xTaskNotifyGive(g_requester);
+
+        while (ulTaskNotifyTake(pdTRUE, 1) == 0) {
+            g_ranger.tick();
+        }
+        xTaskNotifyGive(g_requester);
+    }
+}
+
 } // namespace
 
 extern "C" void power_profiler_set_debug_lines(bool connect)
@@ -719,9 +782,48 @@ extern "C" esp_err_t power_profiler_init(void)
     g_latch.force_all_bypass();
     delay_ms(2);
 
-    ret = init_sensors();
-    g_sensors_ready = ret == ESP_OK;
-    return ret;
+    g_requester = xTaskGetCurrentTaskHandle();
+    if (xTaskCreatePinnedToCore(sampler_task, "prof_sampler", 4096, nullptr, tskIDLE_PRIORITY + 2, &g_sampler,
+                                configNUMBER_OF_CORES - 1) != pdPASS) {
+        ESP_LOGE(TAG, "Sampler task creation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    g_sensors_ready = g_init_result == ESP_OK;
+    return g_init_result;
+}
+
+extern "C" bool power_profiler_sample_begin(uint32_t warmup_ms)
+{
+    if (!g_sensors_ready) {
+        return false;
+    }
+
+    g_requester = xTaskGetCurrentTaskHandle();
+    g_warmup_ms = warmup_ms;
+    xTaskNotifyGive(g_sampler);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return true;
+}
+
+extern "C" void power_profiler_sample_end(power_profiler_result_t *result)
+{
+    g_requester = xTaskGetCurrentTaskHandle();
+    xTaskNotifyGive(g_sampler);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    result->ok = !g_ranger.faulted() && g_ranger.samples() != 0;
+    result->avg_amps = g_ranger.average_amps();
+    result->min_amps = g_ranger.minimum_amps();
+    result->max_amps = g_ranger.maximum_amps();
+    result->vin_volts = g_ranger.last_vbus();
+    result->samples = g_ranger.samples();
+    result->low_samples = g_ranger.range_samples(RANGE_LOW);
+    result->mid_samples = g_ranger.range_samples(RANGE_MID);
+    result->high_samples = g_ranger.range_samples(RANGE_HIGH);
+    result->steps = g_ranger.steps();
+    result->trips = g_ranger.trips(RANGE_MID) + g_ranger.trips(RANGE_HIGH);
 }
 
 extern "C" void power_profiler_run_test(const char *label)

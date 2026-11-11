@@ -11,6 +11,7 @@
 #include <swd_host.h>
 
 #include "power_profiler.h"
+#include "target_power_test.h"
 
 #define CORTEX_M_DHCSR_ADDRESS 0xe000edf0U
 
@@ -548,6 +549,10 @@ cleanup:
         }
     } else if (connected && target_state_known && !target_was_halted) {
         ESP_LOGE(TAG, "Target left halted because its RAM could not be restored");
+    }
+
+    if (connected && safe_to_resume) {
+        target_power_test_run();
     }
 
     if (connected) {
