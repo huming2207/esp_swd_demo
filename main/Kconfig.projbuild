@@ -31,3 +31,52 @@ menu "SWD RAM stress test"
             many iterations.
 
 endmenu
+
+menu "Rev 8 power profiler test"
+
+    config SWD_DEMO_PROF_RUN_SECONDS
+        int "Auto-ranging test duration (seconds)"
+        range 1 3600
+        default 5
+
+    config SWD_DEMO_PROF_DBG_EN_PIN
+        int "DBG_EN GPIO"
+        range 0 61
+        default 57
+
+    config SWD_DEMO_PROF_SDA_PIN
+        int "INA226 I2C SDA GPIO"
+        range 0 61
+        default 17
+
+    config SWD_DEMO_PROF_SCL_PIN
+        int "INA226 I2C SCL GPIO"
+        range 0 61
+        default 18
+
+    config SWD_DEMO_PROF_ALERT_PIN
+        int "INA226 shared /ALERT GPIO"
+        range 0 61
+        default 4
+
+    config SWD_DEMO_PROF_RANGE_D_PIN
+        int "Range latch D GPIO"
+        range 0 61
+        default 19
+
+    config SWD_DEMO_PROF_RANGE_CLK_PIN
+        int "Range latch clock GPIO"
+        range 0 61
+        default 37
+
+    config SWD_DEMO_PROF_HIGH_RB_PIN
+        int "HIGH latch readback GPIO"
+        range 0 61
+        default 38
+
+    config SWD_DEMO_PROF_MID_RB_PIN
+        int "MID latch readback GPIO"
+        range 0 61
+        default 5
+
+endmenu

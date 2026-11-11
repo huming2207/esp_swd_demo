@@ -10,6 +10,8 @@
 #include <freertos/task.h>
 #include <swd_host.h>
 
+#include "power_profiler.h"
+
 #define CORTEX_M_DHCSR_ADDRESS 0xe000edf0U
 
 typedef struct {
@@ -311,7 +313,7 @@ void app_main(void)
     uint64_t mismatched_bytes = 0;
     uint32_t recovery_failures = 0;
 
-    ESP_LOGI(TAG, "Soul Injector Rev 6 SWD transport stress test");
+    ESP_LOGI(TAG, "Soul Injector Rev 8 power profiler and SWD hardware test");
     ESP_LOGI(TAG,
              "RAM range: 0x%08" PRIx32 "..0x%08" PRIx32
              ", block=%u bytes, iterations=%" PRIu32,
@@ -361,6 +363,12 @@ void app_main(void)
         return;
     }
 
+    if (power_profiler_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Power profiler init failed; continuing with the SWD test");
+    }
+    power_profiler_run_test("before SWD, debug lines isolated");
+    power_profiler_force_bypass();
+
     original = malloc(block_size);
     write_buffer = malloc(block_size);
     read_buffer = malloc(block_size);
@@ -370,6 +378,7 @@ void app_main(void)
         goto cleanup;
     }
 
+    power_profiler_set_debug_lines(true);
     if (!swd_init_debug()) {
         ESP_LOGE(TAG, "SWD initialization failed");
         swd_off();
@@ -544,6 +553,8 @@ cleanup:
     if (connected) {
         swd_off();
     }
+    power_profiler_set_debug_lines(false);
+    power_profiler_run_test("after SWD, debug lines isolated");
     free(read_buffer);
     free(write_buffer);
     free(original);
